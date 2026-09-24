@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Files Bram's Setup writes into any project it manages
+.bram.json
+.bram-preflight/
+resources/
+.claude/bram-conventions.md
+.claude/bram-reference/
+.claude/skills/loose-ends/
+.claude/settings.json
+.claude/settings.local.json

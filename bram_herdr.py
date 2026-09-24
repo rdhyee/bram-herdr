@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """bram_herdr.py — run projects under Bram with their agents owned by herdr.
 
-Companion to the ~/.claude/skills/bram-herdr skill. Requires Bram built from
-judell/bram main at or after 1aa63a1 (PR #394, "Do not start an agent"),
-checked out at ~/C/src/bram (or $BRAM_REPO) with its ./bram symlink. macOS.
+See README.md, and skill/SKILL.md for the Claude Code skill that drives it.
+
+Requires Bram built from judell/bram main at or after 1aa63a1 (PR #394,
+"Do not start an agent"), launched via the ./bram symlink in its checkout.
+Point BRAM_REPO at that checkout (default: ~/C/src/bram). Also needs herdr
+(https://herdr.dev) and Python 3.7+. macOS: `front` uses osascript and `up`
+copies to the clipboard with pbcopy. Launch logs go to ~/.cache/bram-herdr/.
 
 Commands:
   status                      Which Bram is running where, and which herdr
@@ -13,15 +17,13 @@ Commands:
      [--exclude] [--dry-run]  (PROMPT_COMMAND in Bram's inherited env; see
      [--no-auto-attach]       launch_bram). Clears leftover attaches first.
   front PROJECT               Bring that project's Bram window to the front
-                              (PROJECT: path or folder name, e.g. wtdickens).
+                              (PROJECT: path or folder name, e.g. myproject).
   say PROJECT TEXT [--wait]   Prompt the herdr agent attached to PROJECT's
                               Bram (or --pane ID).
 
 Standard library only. Writes only PROJECT/.bram.json (merged, other keys kept),
 PROJECT/.bram-preflight/ (backups), and, with --exclude, .git/info/exclude.
 It never edits CLAUDE.md or AGENTS.md; it backs them up and checks them.
-
-cc:2026.09.23: written in the bram-0922 session.
 """
 
 import argparse
@@ -62,8 +64,17 @@ SCRUB_ENV = (
 
 # ---------- helpers ----------
 
+def need(cmd, why):
+    """Exit with a clear message, not a traceback, when a command is missing."""
+    if not shutil.which(cmd):
+        raise SystemExit(f"{cmd} not found on PATH: {why}")
+
+
 def run(cmd, cwd=None, check=True):
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise SystemExit(f"{cmd[0]} not found on PATH (needed for: {' '.join(cmd)})")
     if check and r.returncode != 0:
         raise SystemExit(f"command failed: {' '.join(cmd)}\n{r.stderr.strip()}")
     return r.stdout
@@ -79,6 +90,7 @@ def same_dir(a, b):
 
 
 def herdr_agents():
+    need("herdr", "install herdr, see https://herdr.dev")
     out = run(["herdr", "agent", "list"])
     return json.loads(out)["result"]["agents"]
 
@@ -252,8 +264,8 @@ BRAM_BLOCK = re.compile(rb"<!-- bram:start -->.*?<!-- bram:end -->\n?", re.S)
 
 def outside_bram_block(data):
     """The user's own text: everything outside Bram's managed block, which
-    Setup legitimately rewrites when the conventions change (cc:2026.09.24,
-    after a refreshed block in onrealm's AGENTS.md raised a false alarm)."""
+    Setup legitimately rewrites when the conventions change (a refreshed
+    block in a project's AGENTS.md once raised a false alarm)."""
     return BRAM_BLOCK.sub(b"", data).strip()
 
 
@@ -328,10 +340,11 @@ def pick_agent(project, pane, kind):
 
 def launch_bram(project, dry, attach=None):
     if not (BRAM_REPO / "bram").exists():
-        raise SystemExit(f"no ./bram symlink in {BRAM_REPO}")
+        raise SystemExit(f"no ./bram symlink in {BRAM_REPO}. Set BRAM_REPO to your "
+                         "judell/bram checkout (built from main at or after 1aa63a1).")
     env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
     if attach:
-        # Auto-attach with no Bram change (cc:2026.09.24). Bram's terminal is
+        # Auto-attach with no Bram change. Bram's terminal is
         # bash (--noprofile --rcfile app/shell/claude-code-shellrc -i) and it
         # inherits Bram's environment. Bash imports PROMPT_COMMAND from the
         # environment and runs it just before the first prompt, so this types
@@ -354,7 +367,7 @@ def launch_bram(project, dry, attach=None):
 def clear_orphan_attaches(pane):
     """Quitting a Bram leaves its `herdr agent attach <pane>` running, reparented
     to launchd (ppid 1), still holding the pane, so the next Bram's auto-attach
-    silently fails (seen 2026-09-24 on onrealm, cc:2026.09.24). Kill only those
+    silently fails (seen in practice). Kill only those
     orphans; an attach under a live Bram is real and left alone."""
     for pid, (ppid, cmd) in process_table().items():
         argv = cmd.split()
@@ -418,7 +431,10 @@ def cmd_up(args):
     if args.dry_run:
         print(f"  (dry run) would {'auto-attach' if auto else 'copy to clipboard'}: {attach}")
         return
-    subprocess.run(["pbcopy"], input=attach, text=True)
+    if shutil.which("pbcopy"):
+        subprocess.run(["pbcopy"], input=attach, text=True)
+    else:
+        print("  note: pbcopy not found (not macOS?); the attach command is not on the clipboard")
     print(f"  Bram pid {pid}. {'Auto-attaching' if auto else 'Clipboard'}: {attach}")
 
     line = wait_for_autostart(project, since)
@@ -460,9 +476,10 @@ def running_brams():
 
 
 def cmd_front(args):
-    """Bring a project's Bram window to the front (cc:2026.09.24). Each Bram is
+    """Bring a project's Bram window to the front. Each Bram is
     its own process with one window, so raising the process raises that
-    Bram. PROJECT may be a path or just the folder name (`wtdickens`)."""
+    Bram. PROJECT may be a path or just the folder name (`myproject`)."""
+    need("osascript", "`front` needs macOS")
     brams = running_brams()
     want = Path(args.project).expanduser()
     match = [(p, pid) for p, pid in brams
@@ -492,6 +509,7 @@ def cmd_say(args):
         pane = attached_pane(int(rec["pid"]), process_table())
         if not pane:
             raise SystemExit("that Bram has no herdr agent attached; use --pane")
+    need("herdr", "install herdr, see https://herdr.dev")
     cmd = ["herdr", "agent", "prompt", pane, args.text]
     if args.wait:
         cmd += ["--wait", "--timeout", str(args.timeout * 1000)]
@@ -505,27 +523,43 @@ def cmd_say(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status").set_defaults(fn=cmd_status)
-    u = sub.add_parser("up")
-    u.add_argument("project")
-    u.add_argument("--pane")
-    u.add_argument("--kind", choices=["claude", "codex"])
+    p = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"environment:\n"
+               f"  BRAM_REPO   judell/bram checkout, built from main at or after 1aa63a1\n"
+               f"              and launched via its ./bram symlink (now: {BRAM_REPO})\n"
+               f"logs:\n"
+               f"  {LOG_DIR}/<project>.log  (Bram's output from `up`)\n\n"
+               f"See README.md for requirements and how auto-attach works.")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    sub.add_parser("status", help="which Bram is running where, and which herdr agent "
+                                  "each has attached (read-only)").set_defaults(fn=cmd_status)
+    u = sub.add_parser("up", help="preflight, set 'Do not start an agent', launch Bram, "
+                                  "and attach the herdr agent")
+    u.add_argument("project", help="project directory to run Bram on")
+    u.add_argument("--pane", help="herdr pane id of the agent to attach (e.g. w1:p2); "
+                                  "needed when several agents work in the project")
+    u.add_argument("--kind", choices=["claude", "codex"],
+                   help="only consider herdr agents of this kind")
     u.add_argument("--exclude", action="store_true",
                    help="add Bram's files to .git/info/exclude (local-only)")
-    u.add_argument("--dry-run", action="store_true")
+    u.add_argument("--dry-run", action="store_true",
+                   help="print what would happen; write and launch nothing")
     u.add_argument("--no-auto-attach", action="store_true",
                    help="don't attach automatically; just put the command on the clipboard")
     u.set_defaults(fn=cmd_up)
-    f = sub.add_parser("front", help="bring a project's Bram window to the front")
-    f.add_argument("project", help="path, or just the folder name (e.g. wtdickens)")
+    f = sub.add_parser("front", help="bring a project's Bram window to the front (macOS)")
+    f.add_argument("project", help="path, or just the folder name (e.g. myproject)")
     f.set_defaults(fn=cmd_front)
-    s = sub.add_parser("say")
-    s.add_argument("project", nargs="?", default=".")
-    s.add_argument("text")
-    s.add_argument("--pane")
-    s.add_argument("--wait", action="store_true")
+    s = sub.add_parser("say", help="prompt the herdr agent attached to a project's Bram")
+    s.add_argument("project", nargs="?", default=".",
+                   help="project whose Bram's attached agent gets the text (default: .)")
+    s.add_argument("text", help="the prompt to send")
+    s.add_argument("--pane", help="send to this herdr pane instead of looking it up")
+    s.add_argument("--wait", action="store_true",
+                   help="wait for herdr to report the agent's next state "
+                        "(passes --wait to `herdr agent prompt`)")
     s.add_argument("--timeout", type=int, default=600, help="seconds, with --wait")
     s.set_defaults(fn=cmd_say)
     args = p.parse_args()

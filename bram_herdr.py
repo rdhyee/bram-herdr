@@ -364,21 +364,17 @@ def launch_bram(project, dry, attach=None):
     return proc.pid
 
 
-def clear_orphan_attaches(pane):
-    """Quitting a Bram leaves its `herdr agent attach <pane>` running, reparented
-    to launchd (ppid 1), still holding the pane, so the next Bram's auto-attach
-    silently fails (seen in practice). Kill only those
-    orphans; an attach under a live Bram is real and left alone."""
+def warn_existing_attaches(pane):
+    """Warn if something already holds `herdr agent attach <pane>`; the new
+    Bram's auto-attach would then fail silently. Before Bram 0.7.1 (judell/bram
+    #405) quitting a Bram orphaned its attach to launchd and this tool killed
+    those; Bram now hangs up its terminal's jobs on quit, so it only reports."""
     for pid, (ppid, cmd) in process_table().items():
         argv = cmd.split()
         if argv[:3] == ["herdr", "agent", "attach"] and argv[3:4] == [pane]:
-            if ppid == 1:
-                print(f"  cleanup: stopping leftover attach to {pane} (pid {pid}) from a quit Bram")
-                os.kill(pid, 15)
-            else:
-                print(f"  !! {pane} is already attached in a running terminal (pid {pid}); "
-                      "the new Bram's attach may fail")
-    time.sleep(0.5)
+            where = "orphaned to launchd" if ppid == 1 else "in a running terminal"
+            print(f"  !! {pane} is already attached {where} (pid {pid}); the new Bram's "
+                  f"attach may fail. Stop it with `kill {pid}` if it's stale.")
 
 
 def wait_for_autostart(project, since_ms, timeout=45):
@@ -424,7 +420,7 @@ def cmd_up(args):
     # command line starting with "herdr agent attach".
     attach = f"herdr agent attach {agent['pane_id']}"
     if not args.dry_run:
-        clear_orphan_attaches(agent["pane_id"])
+        warn_existing_attaches(agent["pane_id"])
     auto = not args.no_auto_attach
     since = int(time.time() * 1000)
     pid = launch_bram(project, args.dry_run, attach=attach if auto else None)

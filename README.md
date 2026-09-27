@@ -78,9 +78,11 @@ bash runs `PROMPT_COMMAND` just before it shows its first prompt, so the shell a
 
 `up` also removes `CLAUDE_CODE_*` variables from Bram's environment. Without that, a Bram launched from inside a Claude Code session would make its own agent think it's a child session.
 
-## Cleaning up leftover attaches
+## Leftover attaches
 
-When you quit a Bram, its `herdr agent attach <pane>` keeps running. macOS reparents it to launchd (parent pid 1), and it still holds the pane, so the next Bram's attach fails without saying so. Before launching, `up` stops only those orphaned attaches for the pane it's about to use. An attach that belongs to a live terminal is left alone, with a warning.
+If something is already running `herdr agent attach <pane>` for the pane `up` is about to use, the new Bram's attach fails without saying so. Before launching, `up` checks for that and warns, with the pid to stop.
+
+Before Bram 0.7.1, quitting a Bram left its attach running, orphaned to launchd, and `up` killed those orphans itself. Bram now hangs up its terminal's jobs on every way of quitting ([judell/bram#405](https://github.com/judell/bram/issues/405)), so that cleanup was retired. Use Bram 0.7.1 or later.
 
 ## Limits, and where this should go upstream
 

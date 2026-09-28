@@ -54,6 +54,8 @@ Bram records the agent's identity **at launch only**. To move Bram from Codex to
 
 For each running Bram (`ps` for `bram <path>`), read `<path>/resources/.bram-port.json` (port, pid, root) and `GET /__app-info` (version). Join with `herdr agent list` by cwd. Report a table of project, Bram pid/port/version, attached herdr pane, and other herdr agents in that folder.
 
+**"Who needs me?"** `bram_herdr.py status` ends with a **Needs you** list: agents marked `●` (their herdr state changed since the user last looked) that are now idle, done or blocked, then the user's GitHub review requests and assigned issues. Lead with that list when the user asks what needs them. After the user has read a pane, `bram_herdr.py seen <pane>` clears its `●`; `front` does the same for that Bram's agent.
+
 ## Known gaps: these belong in Bram, not here
 
 Tracked on judell/bram#389:
@@ -71,14 +73,15 @@ Tracked on judell/bram#389:
 
 `bram_herdr.py` at the root of this repo (standard library only, Python 3.7+). Run it with any `python3`.
 
-- `bram_herdr.py status`: every folder with a herdr agent or a running Bram, with Bram's version/pid/port and which herdr pane it has attached. It finds the pane by walking the process tree from the Bram pid to its `herdr agent attach` child. Read-only.
+- `bram_herdr.py status`: every folder with a herdr agent or a running Bram, with Bram's version/pid/port and which herdr pane it has attached. It finds the pane by walking the process tree from the Bram pid to its `herdr agent attach` child. Adds `●` for agents changed since the user last looked and a **Needs you** list with GitHub rows (one `gh` call, reused for 5 minutes; `--refresh` to ask again, `--no-github` to skip). It writes only its own cache in `~/.cache/bram-herdr/`.
 - `bram_herdr.py up <project> [--pane <id>] [--kind claude|codex] [--exclude] [--dry-run] [--no-auto-attach]` runs steps 1–7:
   - It refuses if Bram is already running for the project, and asks for `--pane` when several agents share the folder.
   - It stops any `herdr agent attach` left over from a quit Bram, then launches Bram with the `CLAUDE_CODE_*` variables removed from its environment.
   - It auto-attaches the pane via `PROMPT_COMMAND` (step 6) and waits for the `op=autostart` trace line.
   - It checks that `CLAUDE.md`/`AGENTS.md` kept the user's text outside Bram's `<!-- bram:start/end -->` block. Setup may legitimately refresh the block itself.
   - **Always `--dry-run` first on a new project.**
-- `bram_herdr.py front <project>`: bring that project's Bram window to the front (macOS). `<project>` is a path or just the folder name. It raises the Bram process by pid via `osascript` / System Events, and macOS may ask for Automation permission the first time. Use it when the user says "show me the X Bram".
+- `bram_herdr.py front <project>`: bring that project's Bram window to the front (macOS). `<project>` is a path or just the folder name. It raises the Bram process by pid via `osascript` / System Events, and macOS may ask for Automation permission the first time. Use it when the user says "show me the X Bram". It also marks that Bram's attached agent as seen.
+- `bram_herdr.py seen [<pane> ...] [--all]`: mark herdr agents as looked at, which clears their `●`.
 - `bram_herdr.py say [<project>] "<text>" [--pane <id>] [--wait]`: `herdr agent prompt` to the agent attached to that project's Bram.
 
-It writes only `.bram.json` (merged), `.bram-preflight/` (backups), and, with `--exclude`, `.git/info/exclude`. It never edits `CLAUDE.md` or `AGENTS.md`.
+In a project it writes only `.bram.json` (merged), `.bram-preflight/` (backups), and, with `--exclude`, `.git/info/exclude`. It never edits `CLAUDE.md` or `AGENTS.md`.

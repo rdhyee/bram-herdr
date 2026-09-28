@@ -10,19 +10,23 @@ Point BRAM_REPO at that checkout (default: ~/C/src/bram). Also needs herdr
 copies to the clipboard with pbcopy. Launch logs go to ~/.cache/bram-herdr/.
 
 Commands:
-  status                      Which Bram is running where, and which herdr
-                              agent each one has attached.
+  status [--refresh]          Which Bram is running where, which herdr agent
+         [--no-github]        each one has attached, and a "Needs you" list:
+                              agents changed since you looked, plus GitHub
+                              review requests and issues assigned to you.
+  seen [PANE ...] [--all]     Mark herdr agents as looked at.
   up PROJECT [--pane ID]      Preflight, set "Do not start an agent", launch
      [--kind claude|codex]    Bram, and attach the herdr agent automatically
      [--exclude] [--dry-run]  (PROMPT_COMMAND in Bram's inherited env; see
-     [--no-auto-attach]       launch_bram). Clears leftover attaches first.
+     [--no-auto-attach]       launch_bram). Warns if the pane is already held.
   front PROJECT               Bring that project's Bram window to the front
                               (PROJECT: path or folder name, e.g. myproject).
   say PROJECT TEXT [--wait]   Prompt the herdr agent attached to PROJECT's
                               Bram (or --pane ID).
 
 Standard library only. Writes only PROJECT/.bram.json (merged, other keys kept),
-PROJECT/.bram-preflight/ (backups), and, with --exclude, .git/info/exclude.
+PROJECT/.bram-preflight/ (backups), with --exclude .git/info/exclude, and its
+own cache in ~/.cache/bram-herdr/ (seen.json, github.json).
 It never edits CLAUDE.md or AGENTS.md; it backs them up and checks them.
 """
 
@@ -39,6 +43,11 @@ from pathlib import Path
 
 BRAM_REPO = Path(os.environ.get("BRAM_REPO", "~/C/src/bram")).expanduser()
 LOG_DIR = Path("~/.cache/bram-herdr").expanduser()
+SEEN_FILE = LOG_DIR / "seen.json"      # pane -> what it looked like when you last looked
+GITHUB_CACHE = LOG_DIR / "github.json"
+GITHUB_TTL = 300                        # seconds a GitHub answer is reused
+ASSIGNED_SHOWN = 5                      # assigned-to-you rows shown before "… and N more"
+WAITING = ("idle", "done", "blocked")   # herdr states where an agent is waiting on you
 INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
 # Bram-written paths that don't belong in a project's history (skill step 2).
 BRAM_EXCLUDES = (
@@ -178,9 +187,186 @@ def app_info(port):
         return {}
 
 
+# ---------- changed since you looked ----------
+#
+# herdr stamps each agent with `state_change_seq`, a counter shared by all
+# agents that records its latest state change, but it has no "last viewed"
+# time. So we record, per pane, the seq we saw when you last looked, and flag
+# the pane when herdr's number moves past it. "Looked" = `front`, `seen`, or
+# herdr reporting the pane focused when `status` runs.
+
+def _seq(agent):
+    try:
+        return int(agent.get("state_change_seq"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _seen_record(agent, now=None):
+    return {"terminal_id": agent.get("terminal_id"),
+            "seq": _seq(agent),
+            "at": now or dt.datetime.now().isoformat(timespec="seconds")}
+
+
+def load_seen(path=None):
+    try:
+        data = json.loads(Path(path or SEEN_FILE).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_seen(seen, path=None):
+    path = Path(path or SEEN_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(seen, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def changes_since_seen(agents, seen):
+    """Return (pane ids changed since last looked, updated seen dict).
+
+    A pane with no record, or whose terminal was replaced, is recorded as a
+    baseline and not flagged; otherwise the first run would flag everything."""
+    seen = dict(seen)
+    changed = set()
+    for a in agents:
+        pane, seq = a.get("pane_id"), _seq(a)
+        if not pane or seq is None:
+            continue
+        rec = seen.get(pane)
+        if not isinstance(rec, dict) or rec.get("terminal_id") != a.get("terminal_id"):
+            seen[pane] = _seen_record(a)
+        elif seq > (rec.get("seq") or 0):
+            changed.add(pane)
+    return changed, seen
+
+
+def mark_seen(seen, agents, now=None):
+    """Record these agents as looked at, as of their current state."""
+    seen = dict(seen)
+    for a in agents:
+        if a.get("pane_id") and _seq(a) is not None:
+            seen[a["pane_id"]] = _seen_record(a, now)
+    return seen
+
+
+def try_save_seen(seen):
+    try:
+        save_seen(seen)
+    except OSError as e:
+        print(f"(could not save {SEEN_FILE}: {e})")
+
+
+# ---------- GitHub rows ----------
+
+_ITEM_FIELDS = "number title url updatedAt repository { nameWithOwner }"
+
+
+def github_query():
+    """One GraphQL request carrying both searches (aliased)."""
+    def search(q):
+        return (f'search(query: "{q}", type: ISSUE, first: 20) {{ issueCount nodes {{ '
+                f'... on Issue {{ {_ITEM_FIELDS} }} ... on PullRequest {{ {_ITEM_FIELDS} }} }} }}')
+    return ("query { "
+            f"review: {search('is:open is:pr review-requested:@me archived:false sort:updated-desc')} "
+            f"assigned: {search('is:open assignee:@me archived:false sort:updated-desc')} "
+            "}")
+
+
+def parse_github(data):
+    """GraphQL response -> {"review"|"assigned": {"count": n, "rows": [...]}}."""
+    out = {}
+    for key in ("review", "assigned"):
+        block = ((data or {}).get("data") or {}).get(key) or {}
+        rows = []
+        for n in block.get("nodes") or []:
+            if not n or "url" not in n:
+                continue
+            rows.append({"repo": (n.get("repository") or {}).get("nameWithOwner", "?"),
+                         "number": n.get("number"),
+                         "title": n.get("title", ""),
+                         "url": n["url"],
+                         "updated": (n.get("updatedAt") or "")[:10]})
+        out[key] = {"count": block.get("issueCount", len(rows)), "rows": rows}
+    return out
+
+
+def _read_github_cache():
+    try:
+        c = json.loads(GITHUB_CACHE.read_text())
+        return c if isinstance(c.get("fetched"), (int, float)) and "data" in c else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def github_rows(refresh=False, now=None):
+    """Return (parsed rows or None, note or None). One `gh` call at most,
+    reused for GITHUB_TTL seconds; never raises."""
+    now = now if now is not None else time.time()
+    cache = _read_github_cache()
+    if cache and not refresh and now - cache["fetched"] < GITHUB_TTL:
+        return parse_github(cache["data"]), None
+    err = None
+    if not shutil.which("gh"):
+        err = "gh not found on PATH (https://cli.github.com)"
+    else:
+        try:
+            r = subprocess.run(["gh", "api", "graphql", "-f", "query=" + github_query()],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                data = json.loads(r.stdout)
+                if data.get("data"):
+                    try:
+                        GITHUB_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                        GITHUB_CACHE.write_text(json.dumps({"fetched": now, "data": data}))
+                    except OSError:
+                        pass
+                    return parse_github(data), None
+                err = "unexpected answer from GitHub"
+            else:
+                err = (r.stderr.strip().splitlines() or ["gh failed"])[0]
+        except subprocess.TimeoutExpired:
+            err = "gh timed out after 10 s"
+        except ValueError:
+            err = "could not read gh's output"
+    if cache:
+        mins = int((now - cache["fetched"]) // 60)
+        return parse_github(cache["data"]), f"GitHub: showing rows cached {mins} min ago ({err})"
+    return None, f"GitHub rows skipped: {err}"
+
+
+def github_lines(parsed):
+    lines = []
+    rev = parsed["review"]
+    lines.append(f"  review requested ({rev['count']})" + ("" if rev["rows"] else ": none"))
+    for r in rev["rows"]:
+        lines.append(f"    {r['repo']}#{r['number']}  {r['title'][:70]}  {r['url']}")
+    asg = parsed["assigned"]
+    shown = asg["rows"][:ASSIGNED_SHOWN]
+    head = f"  assigned to you ({asg['count']})"
+    if not shown:
+        lines.append(head + ": none")
+        return lines
+    lines.append(head + (f", {len(shown)} most recently updated:" if asg["count"] > len(shown)
+                         else ":"))
+    for r in shown:
+        lines.append(f"    {r['repo']}#{r['number']}  {r['title'][:70]}  ({r['updated']})  {r['url']}")
+    if asg["count"] > len(shown):
+        lines.append(f"    … and {asg['count'] - len(shown)} more: https://github.com/issues/assigned")
+    return lines
+
+
 # ---------- status ----------
 
-def cmd_status(_args):
+def short_path(path):
+    home = str(Path.home())
+    # herdr may report /Volumes/<disk>/MacHD/Users/... for a ~ path.
+    return "~" + path[path.find(home) + len(home):] if home in path else path
+
+
+def cmd_status(args):
     table = process_table()
     # Candidate projects: every folder a herdr agent works in, plus the bram repo.
     agents = herdr_agents()
@@ -211,10 +397,16 @@ def cmd_status(_args):
         version = app_info(rec["port"]).get("current", "?") if running else ""
         rows.append((shown, running, rec, version, pane, here))
 
+    # Changed since you looked: compare first, then count focused panes as seen
+    # (you're looking at them right now), so they're never flagged.
+    changed, seen = changes_since_seen(agents, load_seen())
+    focused = [a for a in agents if a.get("focused")]
+    seen = mark_seen(seen, focused)
+    changed -= {a["pane_id"] for a in focused}
+    try_save_seen(seen)
+
     for shown, running, rec, version, pane, here in rows:
-        home = str(Path.home())
-        # herdr may report /Volumes/<disk>/MacHD/Users/... for a ~ path.
-        name = "~" + shown[shown.find(home) + len(home):] if home in shown else shown
+        name = short_path(shown)
         if running is None:
             print(f"{name}\n  a bram process is running here, but it has no live port file "
                   "(starting up, refused, or stuck)")
@@ -225,8 +417,46 @@ def cmd_status(_args):
             print(f"{name}\n  Bram not running")
         for a in here:
             mark = "*" if pane and a["pane_id"] == pane else " "
-            print(f"   {mark} {agent_label(a)}")
-    print("\n* = attached in that project's Bram terminal")
+            new = "●" if a["pane_id"] in changed else " "
+            print(f"   {mark}{new} {agent_label(a)}")
+    print("\n* = attached in that project's Bram terminal   ● = changed since you looked")
+
+    print("\nNeeds you")
+    waiting = sorted((a for a in agents
+                      if a["pane_id"] in changed and a.get("agent_status") in WAITING),
+                     key=lambda a: -(_seq(a) or 0))
+    if waiting:
+        print("  agents changed since you looked, now waiting:")
+        for a in waiting:
+            print(f"    ● {agent_label(a)}  ({short_path(a.get('cwd', ''))})")
+    else:
+        print("  no agent has changed and is waiting since you looked")
+    if not args.no_github:
+        parsed, note = github_rows(refresh=args.refresh)
+        if parsed:
+            for line in github_lines(parsed):
+                print(line)
+        if note:
+            print(f"  {note}")
+    print("\nMark agents as looked at with `seen PANE` or `seen --all`.")
+
+
+# ---------- seen ----------
+
+def cmd_seen(args):
+    agents = herdr_agents()
+    if args.all:
+        chosen = agents
+    else:
+        if not args.panes:
+            raise SystemExit("name one or more panes (e.g. `seen w1:p2`), or pass --all")
+        by_id = {a["pane_id"]: a for a in agents}
+        missing = [p for p in args.panes if p not in by_id]
+        if missing:
+            raise SystemExit(f"no herdr agent in pane(s): {', '.join(missing)}")
+        chosen = [by_id[p] for p in args.panes]
+    try_save_seen(mark_seen(load_seen(), chosen))
+    print("marked seen: " + (", ".join(a["pane_id"] for a in chosen) or "nothing"))
 
 
 # ---------- up ----------
@@ -491,6 +721,12 @@ def cmd_front(args):
         raise SystemExit(f"osascript failed (macOS may need Automation/Accessibility "
                          f"permission for this terminal): {r.stderr.strip()}")
     print(f"front: {path} (pid {pid})")
+    # You're looking at this Bram now, so its attached agent counts as seen.
+    pane = attached_pane(pid, process_table())
+    if pane and shutil.which("herdr"):
+        hit = [a for a in herdr_agents() if a["pane_id"] == pane]
+        if hit:
+            try_save_seen(mark_seen(load_seen(), hit))
 
 
 # ---------- say ----------
@@ -526,11 +762,24 @@ def main():
                f"  BRAM_REPO   judell/bram checkout, built from main at or after 1aa63a1\n"
                f"              and launched via its ./bram symlink (now: {BRAM_REPO})\n"
                f"logs:\n"
-               f"  {LOG_DIR}/<project>.log  (Bram's output from `up`)\n\n"
+               f"  {LOG_DIR}/<project>.log  (Bram's output from `up`)\n"
+               f"cache:\n"
+               f"  {SEEN_FILE}  (when you last looked at each agent)\n"
+               f"  {GITHUB_CACHE}  (GitHub rows, reused for {GITHUB_TTL // 60} min)\n\n"
                f"See README.md for requirements and how auto-attach works.")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
-    sub.add_parser("status", help="which Bram is running where, and which herdr agent "
-                                  "each has attached (read-only)").set_defaults(fn=cmd_status)
+    st = sub.add_parser("status", help="which Bram is running where, which herdr agent each "
+                                       "has attached, and what needs you")
+    st.add_argument("--refresh", action="store_true",
+                    help=f"ask GitHub again instead of reusing the answer "
+                         f"from the last {GITHUB_TTL // 60} minutes")
+    st.add_argument("--no-github", action="store_true",
+                    help="skip the GitHub rows (no gh call)")
+    st.set_defaults(fn=cmd_status)
+    se = sub.add_parser("seen", help="mark herdr agents as looked at, clearing their ● marker")
+    se.add_argument("panes", nargs="*", metavar="PANE", help="herdr pane id(s), e.g. w1:p2")
+    se.add_argument("--all", action="store_true", help="mark every herdr agent")
+    se.set_defaults(fn=cmd_seen)
     u = sub.add_parser("up", help="preflight, set 'Do not start an agent', launch Bram, "
                                   "and attach the herdr agent")
     u.add_argument("project", help="project directory to run Bram on")

@@ -38,7 +38,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
+
+try:
+    import fcntl  # macOS and Linux; the seen-file lock is skipped without it
+except ImportError:  # pragma: no cover
+    fcntl = None
 from pathlib import Path
 
 BRAM_REPO = Path(os.environ.get("BRAM_REPO", "~/C/src/bram")).expanduser()
@@ -46,6 +53,7 @@ LOG_DIR = Path("~/.cache/bram-herdr").expanduser()
 SEEN_FILE = LOG_DIR / "seen.json"      # pane -> what it looked like when you last looked
 GITHUB_CACHE = LOG_DIR / "github.json"
 GITHUB_TTL = 300                        # seconds a GitHub answer is reused
+GITHUB_FETCHED = 20                     # rows fetched per search; more -> "… and N more"
 ASSIGNED_SHOWN = 5                      # assigned-to-you rows shown before "… and N more"
 WAITING = ("idle", "done", "blocked")   # herdr states where an agent is waiting on you
 INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
@@ -217,18 +225,67 @@ def load_seen(path=None):
 
 
 def save_seen(seen, path=None):
+    """Atomic write through a unique temp file, so concurrent writers never
+    share (or delete) each other's temp file."""
     path = Path(path or SEEN_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(seen, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(seen, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _seen_lock(path=None):
+    """Exclusive lock around a load -> update -> save of the seen file, so two
+    runs at once (say `status` and `front`) can't lose each other's marks."""
+    path = Path(path or SEEN_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as fh:
+        if fcntl:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def update_seen(fn, path=None):
+    """Run fn(seen) -> (new_seen, result) under the lock, save, return result.
+    If the cache can't be locked or written, still return fn's result (with a
+    one-line note) rather than failing the command."""
+    try:
+        with _seen_lock(path):
+            new, result = fn(load_seen(path))
+            save_seen(new, path)
+            return result
+    except OSError as e:
+        print(f"(could not update {path or SEEN_FILE}: {e})")
+        return fn(load_seen(path))[1]
+
+
+def _record_seq(rec):
+    """The seq in a saved record, or None if the record is unusable."""
+    if not isinstance(rec, dict):
+        return None
+    seq = rec.get("seq")
+    return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
 
 
 def changes_since_seen(agents, seen):
     """Return (pane ids changed since last looked, updated seen dict).
 
-    A pane with no record, or whose terminal was replaced, is recorded as a
-    baseline and not flagged; otherwise the first run would flag everything."""
+    A pane with no usable record, or whose terminal was replaced, is recorded
+    as a baseline and not flagged; otherwise the first run (or a hand-edited
+    or corrupt cache) would flag everything, or crash."""
     seen = dict(seen)
     changed = set()
     for a in agents:
@@ -236,9 +293,10 @@ def changes_since_seen(agents, seen):
         if not pane or seq is None:
             continue
         rec = seen.get(pane)
-        if not isinstance(rec, dict) or rec.get("terminal_id") != a.get("terminal_id"):
+        old = _record_seq(rec)
+        if old is None or rec.get("terminal_id") != a.get("terminal_id"):
             seen[pane] = _seen_record(a)
-        elif seq > (rec.get("seq") or 0):
+        elif seq > old:
             changed.add(pane)
     return changed, seen
 
@@ -252,11 +310,9 @@ def mark_seen(seen, agents, now=None):
     return seen
 
 
-def try_save_seen(seen):
-    try:
-        save_seen(seen)
-    except OSError as e:
-        print(f"(could not save {SEEN_FILE}: {e})")
+def mark_seen_and_save(agents):
+    """Record these agents as looked at, under the seen-file lock."""
+    update_seen(lambda seen: (mark_seen(seen, agents), None))
 
 
 # ---------- GitHub rows ----------
@@ -267,7 +323,8 @@ _ITEM_FIELDS = "number title url updatedAt repository { nameWithOwner }"
 def github_query():
     """One GraphQL request carrying both searches (aliased)."""
     def search(q):
-        return (f'search(query: "{q}", type: ISSUE, first: 20) {{ issueCount nodes {{ '
+        return (f'search(query: "{q}", type: ISSUE, first: {GITHUB_FETCHED}) '
+                f'{{ issueCount nodes {{ '
                 f'... on Issue {{ {_ITEM_FIELDS} }} ... on PullRequest {{ {_ITEM_FIELDS} }} }} }}')
     return ("query { "
             f"review: {search('is:open is:pr review-requested:@me archived:false sort:updated-desc')} "
@@ -275,35 +332,66 @@ def github_query():
             "}")
 
 
+def _dict(x):
+    return x if isinstance(x, dict) else {}
+
+
+def _str(x):
+    return x if isinstance(x, str) else ""
+
+
 def parse_github(data):
-    """GraphQL response -> {"review"|"assigned": {"count": n, "rows": [...]}}."""
+    """GraphQL response -> {"review"|"assigned": {"count": n, "rows": [...]}}.
+    Anything of the wrong shape is skipped, never raised on."""
     out = {}
     for key in ("review", "assigned"):
-        block = ((data or {}).get("data") or {}).get(key) or {}
+        block = _dict(_dict(_dict(data).get("data")).get(key))
+        nodes = block.get("nodes")
         rows = []
-        for n in block.get("nodes") or []:
-            if not n or "url" not in n:
+        for n in nodes if isinstance(nodes, list) else []:
+            n = _dict(n)
+            if not _str(n.get("url")):
                 continue
-            rows.append({"repo": (n.get("repository") or {}).get("nameWithOwner", "?"),
-                         "number": n.get("number"),
-                         "title": n.get("title", ""),
+            number = n.get("number")
+            rows.append({"repo": _str(_dict(n.get("repository")).get("nameWithOwner")) or "?",
+                         "number": number if isinstance(number, int) else "?",
+                         "title": _str(n.get("title")),
                          "url": n["url"],
-                         "updated": (n.get("updatedAt") or "")[:10]})
-        out[key] = {"count": block.get("issueCount", len(rows)), "rows": rows}
+                         "updated": _str(n.get("updatedAt"))[:10]})
+        count = block.get("issueCount")
+        if not isinstance(count, int) or isinstance(count, bool) or count < len(rows):
+            count = len(rows)
+        out[key] = {"count": count, "rows": rows}
     return out
 
 
+def _has_search_data(data):
+    d = _dict(_dict(data).get("data"))
+    return any(isinstance(d.get(k), dict) for k in ("review", "assigned"))
+
+
 def _read_github_cache():
+    """The saved answer, or None if it's missing or not the shape we write."""
     try:
         c = json.loads(GITHUB_CACHE.read_text())
-        return c if isinstance(c.get("fetched"), (int, float)) and "data" in c else None
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError):
         return None
+    if (isinstance(c, dict) and isinstance(c.get("fetched"), (int, float))
+            and not isinstance(c.get("fetched"), bool) and _has_search_data(c.get("data"))):
+        return c
+    return None
 
 
 def github_rows(refresh=False, now=None):
     """Return (parsed rows or None, note or None). One `gh` call at most,
     reused for GITHUB_TTL seconds; never raises."""
+    try:
+        return _github_rows(refresh, now)
+    except Exception as e:  # last line of defence: GitHub must never break `status`
+        return None, f"GitHub rows skipped: {type(e).__name__}: {e}"
+
+
+def _github_rows(refresh, now):
     now = now if now is not None else time.time()
     cache = _read_github_cache()
     if cache and not refresh and now - cache["fetched"] < GITHUB_TTL:
@@ -317,7 +405,7 @@ def github_rows(refresh=False, now=None):
                                capture_output=True, text=True, timeout=10)
             if r.returncode == 0:
                 data = json.loads(r.stdout)
-                if data.get("data"):
+                if _has_search_data(data):
                     try:
                         GITHUB_CACHE.parent.mkdir(parents=True, exist_ok=True)
                         GITHUB_CACHE.write_text(json.dumps({"fetched": now, "data": data}))
@@ -331,6 +419,8 @@ def github_rows(refresh=False, now=None):
             err = "gh timed out after 10 s"
         except ValueError:
             err = "could not read gh's output"
+        except OSError as e:
+            err = f"could not run gh ({e})"
     if cache:
         mins = int((now - cache["fetched"]) // 60)
         return parse_github(cache["data"]), f"GitHub: showing rows cached {mins} min ago ({err})"
@@ -343,6 +433,10 @@ def github_lines(parsed):
     lines.append(f"  review requested ({rev['count']})" + ("" if rev["rows"] else ": none"))
     for r in rev["rows"]:
         lines.append(f"    {r['repo']}#{r['number']}  {r['title'][:70]}  {r['url']}")
+    if rev["count"] > len(rev["rows"]):
+        # The query fetches the first GITHUB_FETCHED; say so instead of dropping the rest.
+        lines.append(f"    … and {rev['count'] - len(rev['rows'])} more: "
+                     "https://github.com/pulls/review-requested")
     asg = parsed["assigned"]
     shown = asg["rows"][:ASSIGNED_SHOWN]
     head = f"  assigned to you ({asg['count']})"
@@ -399,11 +493,13 @@ def cmd_status(args):
 
     # Changed since you looked: compare first, then count focused panes as seen
     # (you're looking at them right now), so they're never flagged.
-    changed, seen = changes_since_seen(agents, load_seen())
     focused = [a for a in agents if a.get("focused")]
-    seen = mark_seen(seen, focused)
-    changed -= {a["pane_id"] for a in focused}
-    try_save_seen(seen)
+
+    def look(seen):
+        changed, seen = changes_since_seen(agents, seen)
+        return mark_seen(seen, focused), changed - {a["pane_id"] for a in focused}
+
+    changed = update_seen(look)
 
     for shown, running, rec, version, pane, here in rows:
         name = short_path(shown)
@@ -455,7 +551,7 @@ def cmd_seen(args):
         if missing:
             raise SystemExit(f"no herdr agent in pane(s): {', '.join(missing)}")
         chosen = [by_id[p] for p in args.panes]
-    try_save_seen(mark_seen(load_seen(), chosen))
+    mark_seen_and_save(chosen)
     print("marked seen: " + (", ".join(a["pane_id"] for a in chosen) or "nothing"))
 
 
@@ -726,7 +822,7 @@ def cmd_front(args):
     if pane and shutil.which("herdr"):
         hit = [a for a in herdr_agents() if a["pane_id"] == pane]
         if hit:
-            try_save_seen(mark_seen(load_seen(), hit))
+            mark_seen_and_save(hit)
 
 
 # ---------- say ----------

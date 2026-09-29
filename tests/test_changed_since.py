@@ -4,6 +4,8 @@ Run from the repo root:  python3 -m unittest discover -s tests
 """
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -58,6 +60,19 @@ class ChangesSinceSeen(unittest.TestCase):
         self.assertEqual(changed, set())
         self.assertEqual(seen, {})
 
+    def test_malformed_records_become_a_baseline_not_a_crash(self):
+        # Hand-edited or corrupt cache entries (Codex review of PR #1, finding 1).
+        for bad in ({"seq": "x", "terminal_id": "t1"},
+                    {"seq": True, "terminal_id": "t1"},
+                    {"seq": None, "terminal_id": "t1"},
+                    {"terminal_id": "t1"},
+                    ["not", "a", "dict"],
+                    "string"):
+            with self.subTest(bad=bad):
+                changed, seen = bh.changes_since_seen([agent("w1:p1", 10)], {"w1:p1": bad})
+                self.assertEqual(changed, set())
+                self.assertEqual(seen["w1:p1"]["seq"], 10)
+
     def test_inputs_are_not_mutated(self):
         seen = {}
         bh.changes_since_seen([agent("w1:p1", 10)], seen)
@@ -85,6 +100,50 @@ class SeenFile(unittest.TestCase):
                 self.assertEqual(bh.load_seen(), {})          # corrupt file
                 path.write_text("[1, 2]")
                 self.assertEqual(bh.load_seen(), {})          # wrong shape
+
+    def test_save_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "seen.json"
+            bh.save_seen({"a": 1}, path)
+            bh.save_seen({"a": 2}, path)
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["seen.json"])
+
+
+class UpdateSeen(unittest.TestCase):
+    """Concurrent writers (Codex review of PR #1, finding 3)."""
+
+    def test_concurrent_updates_keep_both_marks(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "seen.json"
+
+            def mark(pane):
+                def fn(seen):
+                    time.sleep(0.05)   # widen the load -> save window
+                    return bh.mark_seen(seen, [agent(pane, 1)]), None
+                bh.update_seen(fn, path)
+
+            threads = [threading.Thread(target=mark, args=(p,)) for p in ("w1:p1", "w1:p2")]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(sorted(bh.load_seen(path)), ["w1:p1", "w1:p2"])
+
+    def test_returns_result_and_saves(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "seen.json"
+            out = bh.update_seen(lambda s: ({"x": {"seq": 1}}, "result"), path)
+            self.assertEqual(out, "result")
+            self.assertEqual(bh.load_seen(path), {"x": {"seq": 1}})
+
+    def test_write_failure_still_returns_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "seen.json"
+            with mock.patch.object(bh, "save_seen", side_effect=OSError("disk full")), \
+                 mock.patch("builtins.print") as printed:
+                out = bh.update_seen(lambda s: (s, "still here"), path)
+            self.assertEqual(out, "still here")
+            self.assertIn("disk full", printed.call_args[0][0])
 
 
 if __name__ == "__main__":

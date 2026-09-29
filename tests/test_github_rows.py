@@ -46,6 +46,24 @@ class ParseGithub(unittest.TestCase):
         data = {"data": {"review": {"issueCount": 1, "nodes": [None, {"title": "no url"}]}}}
         self.assertEqual(bh.parse_github(data)["review"]["rows"], [])
 
+    def test_wrong_shapes_never_raise(self):
+        # Codex review of PR #1, finding 2.
+        empty = {"count": 0, "rows": []}
+        for bad in (None, [], "x", 5, {"data": []}, {"data": {"review": []}},
+                    {"data": {"review": {"nodes": "x", "issueCount": "7"}}},
+                    {"data": {"review": {"nodes": [1, "x", [], {"url": 5}]}}}):
+            with self.subTest(bad=bad):
+                out = bh.parse_github(bad)
+                self.assertEqual(out["review"], empty)
+                self.assertEqual(out["assigned"], empty)
+
+    def test_odd_field_types_are_coerced(self):
+        n = {"url": "https://x/1", "number": "7", "title": None,
+             "updatedAt": 5, "repository": "nope"}
+        row = bh.parse_github({"data": {"review": {"issueCount": 1, "nodes": [n]}}})["review"]["rows"][0]
+        self.assertEqual(row, {"repo": "?", "number": "?", "title": "", "url": "https://x/1",
+                               "updated": ""})
+
 
 class GithubLines(unittest.TestCase):
     def test_assigned_is_capped_with_more_line(self):
@@ -55,6 +73,15 @@ class GithubLines(unittest.TestCase):
         self.assertIn("assigned to you (69), 5 most recently updated:", lines[1])
         self.assertEqual(len([l for l in lines if l.startswith("    a/b#")]), bh.ASSIGNED_SHOWN)
         self.assertIn("… and 64 more: https://github.com/issues/assigned", lines[-1])
+
+    def test_review_requests_beyond_fetched_get_a_more_line(self):
+        # Codex review of PR #1, finding 4: the query fetches GITHUB_FETCHED rows.
+        data = response(review=[node("x/y", i) for i in range(bh.GITHUB_FETCHED)],
+                        assigned=[node("a/b", 1)])
+        data["data"]["review"]["issueCount"] = 23
+        lines = bh.github_lines(bh.parse_github(data))
+        self.assertEqual(len([l for l in lines if l.startswith("    x/y#")]), bh.GITHUB_FETCHED)
+        self.assertIn("    … and 3 more: https://github.com/pulls/review-requested", lines)
 
     def test_all_review_requests_shown_and_no_more_line_when_few(self):
         data = response(review=[node("x/y", i) for i in range(7)], assigned=[node("a/b", 1)])
@@ -143,6 +170,44 @@ class GithubRows(unittest.TestCase):
             out, note = bh.github_rows(now=1000)
         self.assertIsNone(out)
         self.assertEqual(note, "GitHub rows skipped: gh timed out after 10 s")
+
+    def test_spawn_oserror_is_a_skip_note(self):
+        with mock.patch.object(bh.subprocess, "run", side_effect=PermissionError("denied")):
+            out, note = bh.github_rows(now=1000)
+        self.assertIsNone(out)
+        self.assertEqual(note, "GitHub rows skipped: could not run gh (denied)")
+
+    def test_malformed_cache_is_ignored(self):
+        for bad in ('{"fetched": 1000, "data": []}',
+                    '{"fetched": 1000, "data": {"data": "x"}}',
+                    '{"fetched": "soon", "data": {"data": {"review": {}}}}',
+                    '{"fetched": true, "data": {"data": {"review": {}}}}',
+                    '[1, 2]', 'not json'):
+            with self.subTest(bad=bad):
+                self.cache.write_text(bad)
+                with mock.patch.object(bh.subprocess, "run",
+                                       return_value=self.ok(response())) as run:
+                    out, note = bh.github_rows(now=1001)
+                self.assertEqual(run.call_count, 1)      # cache not trusted
+                self.assertIsNone(note)
+                self.assertEqual(out["review"]["count"], 0)
+
+    def test_malformed_api_answer_is_a_skip_note(self):
+        for bad in ({"data": []}, {"data": {"review": "x"}}, [], "x"):
+            with self.subTest(bad=bad):
+                if self.cache.exists():
+                    self.cache.unlink()
+                with mock.patch.object(bh.subprocess, "run", return_value=self.ok(bad)):
+                    out, note = bh.github_rows(now=1000)
+                self.assertIsNone(out)
+                self.assertIn("GitHub rows skipped", note)
+                self.assertFalse(self.cache.exists())
+
+    def test_unexpected_exception_never_escapes(self):
+        with mock.patch.object(bh, "_github_rows", side_effect=RuntimeError("boom")):
+            out, note = bh.github_rows()
+        self.assertIsNone(out)
+        self.assertEqual(note, "GitHub rows skipped: RuntimeError: boom")
 
     def test_graphql_errors_without_data(self):
         bad = self.ok({"errors": [{"message": "nope"}]})

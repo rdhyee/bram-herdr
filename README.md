@@ -95,7 +95,7 @@ The caveats:
 
 ### GitHub rows
 
-`status` also lists open PRs where **your review is requested** (all of them) and open issues and PRs **assigned to you** (the 5 most recently updated, then a count and a link to the full list). Both come from **one** `gh api graphql` request with two searches, using `@me` for whoever `gh` is logged in as.
+`status` also lists open PRs where **your review is requested** (up to 20, then a count and a link to the rest) and open issues and PRs **assigned to you** (the 5 most recently updated, then a count and a link to the full list). Both come from **one** `gh api graphql` request with two searches, using `@me` for whoever `gh` is logged in as.
 
 The answer is reused for **5 minutes** (`~/.cache/bram-herdr/github.json`), so running `status` often doesn't hit GitHub each time. `--refresh` asks again, and `--no-github` skips GitHub entirely. The `gh` call times out after 10 seconds. If it fails, `status` shows the last saved answer labelled with its age, or one line saying the rows were skipped.
 

@@ -11,9 +11,14 @@ herdr keeps every agent in one terminal workspace that you can drive from the co
 ## Commands
 
 ```sh
-bram_herdr.py status
+bram_herdr.py status [--refresh] [--no-github]
 ```
-Which Bram is running where, with its version, pid and port, which herdr pane it has attached, and the other herdr agents in that folder. Read-only.
+Which Bram is running where, with its version, pid and port, which herdr pane it has attached, and the other herdr agents in that folder. A `●` marks agents that changed since you last looked. It ends with a **Needs you** list: those changed agents that are now waiting on you, then your GitHub review requests and assigned issues (see [Needs you](#needs-you)).
+
+```sh
+bram_herdr.py seen [PANE ...] [--all]
+```
+Marks herdr agents as looked at, which clears their `●`. Use it after reading a pane in herdr.
 
 ```sh
 bram_herdr.py up PROJECT [--pane ID] [--kind claude|codex] [--exclude] [--dry-run] [--no-auto-attach]
@@ -23,7 +28,7 @@ Backs up `CLAUDE.md`/`AGENTS.md` if git can't restore them, sets "Do not start a
 ```sh
 bram_herdr.py front PROJECT
 ```
-Brings that project's Bram window to the front (macOS). `PROJECT` is a path or just the folder name.
+Brings that project's Bram window to the front (macOS). `PROJECT` is a path or just the folder name. It also counts as looking at that Bram's attached agent, so the agent's `●` clears.
 
 ```sh
 bram_herdr.py say [PROJECT] TEXT [--pane ID] [--wait]
@@ -39,6 +44,7 @@ Sends a prompt to the agent attached to that project's Bram, through `herdr agen
 - **[herdr](https://herdr.dev)** on your `PATH` (`brew install herdr`). Tested with herdr 0.8.2.
 - **Bram built from [judell/bram](https://github.com/judell/bram) `main` at or after `1aa63a1`**, the merge of #394. Released Bram 0.6.9 and earlier doesn't have the "Do not start an agent" setting. The script launches Bram through the `./bram` symlink in that checkout, so the files it serves come from disk.
 - **`BRAM_REPO`** set to that checkout. It defaults to `~/C/src/bram`.
+- **Optional: [GitHub CLI](https://cli.github.com) (`gh`)**, logged in, for the GitHub rows in `status`. Without it, `status` prints one line saying the rows were skipped and carries on.
 
 ## Install
 
@@ -56,13 +62,50 @@ ln -s "$PWD/bram-herdr/skill" ~/.claude/skills/bram-herdr
 
 ## What it touches
 
-`up` writes only these:
+In your project, `up` writes only these:
 
 - `PROJECT/.bram.json`: it sets `shell.startupPolicy` and `shell.agent` and keeps your other keys.
 - `PROJECT/.bram-preflight/<timestamp>/`: backups of `CLAUDE.md`/`AGENTS.md` when git can't restore them.
 - `.git/info/exclude`: only with `--exclude`.
 
+Outside your projects, the tool keeps its own cache in `~/.cache/bram-herdr/`: `seen.json` (when you last looked at each agent, written by `status`, `seen` and `front`) and `github.json` (the last GitHub answer).
+
 It **never** edits `CLAUDE.md` or `AGENTS.md`. After Bram's Setup runs, it checks that your text outside Bram's `<!-- bram:start --> … <!-- bram:end -->` block is unchanged, because Setup has been seen to wipe it ([judell/bram#396](https://github.com/judell/bram/issues/396)). Bram's own launch output goes to `~/.cache/bram-herdr/<project>.log`.
+
+## Needs you
+
+The point of this section of `status` is to answer "who needs me?" without reading every pane.
+
+### Changed since you looked
+
+Roughly: `●` means "this agent did something since you last told the tool you looked at it".
+
+More precisely: herdr gives every agent a `state_change_seq`, a counter shared by all agents that records its latest state change (to `working`, `idle`, `done`, `blocked` and so on). herdr has no "last viewed" time, so the tool records the number it saw each time you look, and flags the agent when herdr's number moves past it. These count as looking:
+
+- `front PROJECT`: that Bram's attached agent;
+- `seen PANE` or `seen --all`;
+- the pane herdr reports as focused when you run `status`.
+
+The **Needs you** list shows flagged agents that are now `idle`, `done` or `blocked`, most recent first. Flagged agents still `working` keep their `●` in the main list but stay out of Needs you.
+
+The caveats:
+
+- The tool can't see you read a pane directly in herdr or glance at a Bram window. Use `seen` or `front` for those.
+- The first time the tool meets an agent (or a new terminal in a reused pane), it records a starting point and doesn't flag it. Otherwise the first run would flag everything.
+
+### GitHub rows
+
+`status` also lists open PRs where **your review is requested** (up to 20, then a count and a link to the rest) and open issues and PRs **assigned to you** (the 5 most recently updated, then a count and a link to the full list). Both come from **one** `gh api graphql` request with two searches, using `@me` for whoever `gh` is logged in as.
+
+The answer is reused for **5 minutes** (`~/.cache/bram-herdr/github.json`), so running `status` often doesn't hit GitHub each time. `--refresh` asks again, and `--no-github` skips GitHub entirely. The `gh` call times out after 10 seconds. If it fails, `status` shows the last saved answer labelled with its age, or one line saying the rows were skipped.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+Standard library only. The tests don't touch herdr, GitHub or your real cache.
 
 ## How auto-attach works
 
@@ -89,7 +132,7 @@ Before Bram 0.7.1, quitting a Bram left its attach running, orphaned to launchd,
 These are workarounds, and they should go away as Bram grows the features:
 
 - [judell/bram#389](https://github.com/judell/bram/issues/389): run an external command such as `herdr agent attach` in Bram's agent pane while keeping the Worklist gate. This is the umbrella issue this tool works around.
-- [judell/bram#401](https://github.com/judell/bram/issues/401): one view across several separate Brams.
+- [judell/bram#401](https://github.com/judell/bram/issues/401): one view across several separate Brams. `status`'s Needs you list is a command-line stand-in for this.
 - [judell/bram#402](https://github.com/judell/bram/issues/402): steer Bram from a phone.
 - [judell/bram#403](https://github.com/judell/bram/issues/403): tell Bram instances apart in the Dock.
 

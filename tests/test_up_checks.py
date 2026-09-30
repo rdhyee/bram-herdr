@@ -29,11 +29,45 @@ class CheckBramRepo(unittest.TestCase):
         self.assertIn("Set BRAM_REPO", str(cm.exception))
         self.assertIn(repo, str(cm.exception))
 
-    def test_present_symlink_passes(self):
+    def test_executable_file_passes(self):
         with tempfile.TemporaryDirectory() as repo:
-            (Path(repo) / "bram").write_text("")
+            bram = Path(repo) / "bram"
+            bram.write_text("#!/bin/sh\n")
+            bram.chmod(0o755)
             with mock.patch.object(bh, "BRAM_REPO", Path(repo)):
                 bh.check_bram_repo()  # no exception
+
+    def test_non_executable_file_or_directory_is_rejected(self):
+        # Codex review of PR #2, finding 5: existing is not the same as runnable.
+        with tempfile.TemporaryDirectory() as repo:
+            bram = Path(repo) / "bram"
+            bram.write_text("")
+            bram.chmod(0o644)
+            with mock.patch.object(bh, "BRAM_REPO", Path(repo)):
+                with self.assertRaises(SystemExit) as cm:
+                    bh.check_bram_repo()
+            self.assertIn("not an executable file", str(cm.exception))
+            bram.unlink()
+            bram.mkdir()
+            with mock.patch.object(bh, "BRAM_REPO", Path(repo)):
+                with self.assertRaises(SystemExit) as cm:
+                    bh.check_bram_repo()
+            self.assertIn("not an executable file", str(cm.exception))
+
+
+class LaunchBramDryRun(unittest.TestCase):
+    def test_dry_run_creates_no_log_folder(self):
+        # Codex review of PR #2, finding 4: a dry run must not create anything.
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as cache:
+            bram = Path(repo) / "bram"
+            bram.write_text("#!/bin/sh\n")
+            bram.chmod(0o755)
+            log_dir = Path(cache) / "not-yet"
+            with mock.patch.object(bh, "BRAM_REPO", Path(repo)), \
+                 mock.patch.object(bh, "LOG_DIR", log_dir), \
+                 mock.patch("builtins.print"):
+                self.assertIsNone(bh.launch_bram(Path("/some/proj"), dry=True))
+            self.assertFalse(log_dir.exists())
 
 
 class UpWritesNothingWhenRepoIsWrong(unittest.TestCase):

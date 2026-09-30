@@ -72,10 +72,10 @@ class RestartWorld(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.proj = Path(self.tmp.name)
+        self.proj = Path(self.tmp.name).resolve()
         self.killed = []
         self.old_agent = agent()
-        self.bram_cmd = "/src/bram/app/bram /proj"
+        self.bram_cmd = f"/src/bram/app/bram {self.proj}"
         self.attached = "w1:p2"
         self.rec = {"pid": OLD_PID, "port": 50000}
 
@@ -89,6 +89,7 @@ class RestartWorld(unittest.TestCase):
         self.prompts = []
         patches = [
             mock.patch.object(bh, "need"),
+            mock.patch.object(bh, "process_cwd", return_value=None),
             mock.patch.object(bh, "check_bram_repo"),
             mock.patch.object(bh, "port_record", side_effect=port_record),
             mock.patch.object(bh, "pid_alive", side_effect=pid_alive),
@@ -154,6 +155,44 @@ class RestartRefuses(RestartWorld):
         self.old_agent = agent(status="working")
         self.assert_refuses("is working")
 
+    def test_unknown_or_missing_status_fails_closed(self):
+        for status, words in (("unknown", "is unknown"), (None, "in an unknown state")):
+            with self.subTest(status=status):
+                self.old_agent = agent(status=status)
+                self.assert_refuses(words)
+
+    def test_pid_reused_by_another_projects_bram_is_never_killed(self):
+        # Codex review of PR #2, finding 1: a stale port file names a pid that
+        # now belongs to a Bram for a different project.
+        with tempfile.TemporaryDirectory() as other:
+            self.bram_cmd = f"/src/bram/app/bram {other}"
+            self.assert_refuses("not for")
+
+    def test_agent_turns_busy_between_check_and_kill(self):
+        # finding 2: the first look says idle, the look just before the kill says working
+        looks = iter([[agent()], [agent(status="working")]])
+        with mock.patch.object(bh, "herdr_agents", side_effect=lambda: next(looks)):
+            self.assert_refuses("is working")
+
+    def test_claim_appearing_before_the_kill_is_caught(self):
+        real = bh.process_table
+        calls = []
+
+        def table():
+            calls.append(1)
+            if len(calls) == 2:          # the re-check just before the kill
+                self.claim()
+            return {OLD_PID: (1, self.bram_cmd)}
+        with mock.patch.object(bh, "process_table", side_effect=table):
+            self.assert_refuses("appeared")
+
+    def test_kill_permission_error_means_nothing_was_quit(self):
+        with mock.patch.object(bh.os, "kill", side_effect=PermissionError("no")):
+            with self.assertRaises(SystemExit) as cm:
+                self.restart()
+        self.assertIn("Nothing was quit", str(cm.exception))
+        self.up.assert_not_called()
+
     def test_inflight_claim_stops_a_real_run(self):
         self.claim()
         self.assert_refuses("Worklist claim is in flight")
@@ -181,6 +220,47 @@ class RestartRuns(RestartWorld):
         self.assertEqual(self.up.call_args[1]["agent"]["pane_id"], "w1:p2")
         self.assertFalse(self.up.call_args[1]["dry_run"])
         self.assertEqual(self.prompts, [])
+
+    def test_done_and_blocked_agents_are_fine_to_restart(self):
+        for status in ("done", "blocked", "idle"):
+            with self.subTest(status=status):
+                self.killed.clear()
+                self.old_agent = agent(status=status)
+                self.restart()
+                self.assertEqual(self.killed, [(OLD_PID, 15)])
+
+    def test_bram_already_gone_at_kill_time_still_relaunches(self):
+        def gone(pid, sig):
+            self.killed.append((pid, sig))
+            raise ProcessLookupError()
+        with mock.patch.object(bh.os, "kill", side_effect=gone):
+            self.restart()
+        self.up.assert_called_once()
+
+    def test_failure_after_the_kill_gives_the_recovery_command(self):
+        # finding 3: Bram is quit, so the error must say so and how to recover
+        for exc in (SystemExit("no ./bram symlink"), RuntimeError("boom")):
+            with self.subTest(exc=exc):
+                self.killed.clear()
+                self.up.side_effect = exc
+                with self.assertRaises(SystemExit) as cm:
+                    self.restart()
+                msg = str(cm.exception)
+                self.assertIn("quit and was NOT relaunched", msg)
+                self.assertIn(f"up {self.proj} --pane w1:p2", msg)
+
+    def test_pane_split_failure_after_the_kill_gives_the_recovery_command(self):
+        with mock.patch.object(bh, "split_pane", side_effect=SystemExit("pane split failed")):
+            with self.assertRaises(SystemExit) as cm:
+                self.restart(fresh=True, name="demo")
+        self.assertIn("pane split failed", str(cm.exception))
+        self.assertIn(f"up {self.proj} --pane w1:p2", str(cm.exception))   # old pane
+
+    def test_dry_run_failures_are_not_wrapped_as_quit(self):
+        self.up.side_effect = SystemExit("plain failure")
+        with self.assertRaises(SystemExit) as cm:
+            self.restart(dry_run=True)
+        self.assertEqual(str(cm.exception), "plain failure")
 
     def test_resume_prompt_sent_only_after_attach_confirmed(self):
         self.restart(resume=True)
@@ -234,7 +314,8 @@ class RestartRuns(RestartWorld):
         with mock.patch.object(bh.subprocess, "run", side_effect=replies):
             with self.assertRaises(SystemExit) as cm:
                 self.restart(fresh=True, name="demo")
-        self.assertIn("Bram is quit", str(cm.exception))
+        self.assertIn("NOT relaunched", str(cm.exception))
+        self.assertIn(f"up {self.proj} --pane w1:p9", str(cm.exception))
         self.up.assert_not_called()
 
 

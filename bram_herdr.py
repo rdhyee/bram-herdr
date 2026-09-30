@@ -125,7 +125,8 @@ def agents_in(project):
 
 def agent_label(a):
     name = a.get("name") or a.get("terminal_title_stripped") or ""
-    return f"{a['pane_id']}  {a['agent']:<6}  {a.get('agent_status', '?'):<8}  {name}"
+    status = a.get("agent_status") or "?"   # a null status must not crash the label
+    return f"{a['pane_id']}  {a['agent']:<6}  {status:<8}  {name}"
 
 
 def pid_alive(pid):
@@ -672,15 +673,19 @@ def pick_agent(project, pane, kind):
 
 
 def check_bram_repo():
-    """Fail early, before `up` writes anything, if BRAM_REPO has no ./bram."""
-    if not (BRAM_REPO / "bram").exists():
-        raise SystemExit(f"no ./bram symlink in {BRAM_REPO}. Set BRAM_REPO to your "
-                         "judell/bram checkout (built from main at or after 1aa63a1).")
+    """Fail early, before `up` writes anything, if BRAM_REPO has no usable ./bram."""
+    bram = BRAM_REPO / "bram"
+    hint = ("Set BRAM_REPO to your judell/bram checkout "
+            "(built from main at or after 1aa63a1).")
+    if not bram.exists():
+        raise SystemExit(f"no ./bram symlink in {BRAM_REPO}. {hint}")
+    if not bram.is_file() or not os.access(str(bram), os.X_OK):
+        raise SystemExit(f"{bram} is not an executable file. {hint}")
 
 
 def launch_bram(project, dry, attach=None):
     check_bram_repo()
-    env ={k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
     if attach:
         # Auto-attach with no Bram change. Bram's terminal is
         # bash (--noprofile --rcfile app/shell/claude-code-shellrc -i) and it
@@ -690,11 +695,11 @@ def launch_bram(project, dry, attach=None):
         # so detaching returns to a plain prompt, and so the attach process
         # (and anything after) doesn't inherit it.
         env["PROMPT_COMMAND"] = f"unset PROMPT_COMMAND; {attach}"
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = LOG_DIR / f"{project.name}.log"
     print(f"  launch: (cd {BRAM_REPO} && ./bram {project})  log: {log}")
     if dry:
-        return None
+        return None  # a dry run creates nothing, not even the log folder
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     fh = log.open("ab")
     proc = subprocess.Popen(["./bram", str(project)], cwd=BRAM_REPO, env=env,
                             stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
@@ -850,6 +855,34 @@ def herdr_prompt(target, text):
     return ok
 
 
+def not_this_brams_pid(pid, project, table):
+    """Why `pid` must not be signalled as the Bram for `project`, or None if it
+    is that Bram. A stale .bram-port.json can name a pid that was reused, even
+    by another project's Bram, so check the command and its project argument."""
+    entry = table.get(pid)
+    argv = entry[1].split() if entry else []
+    if not argv or os.path.basename(argv[0]) != "bram":
+        return (f"pid {pid} from .bram-port.json is not a bram process "
+                f"({' '.join(argv) or 'gone'}); not killing it")
+    if not any(same_dir(p, project) for p in running_bram_projects({pid: entry})):
+        return (f"pid {pid} is a Bram, but not for {project} (stale "
+                ".bram-port.json?); not killing it")
+    return None
+
+
+def find_agent(pane):
+    return next((a for a in herdr_agents() if a["pane_id"] == pane), None)
+
+
+def agent_not_quiet(agent):
+    """A STOP message unless herdr reports the agent in a known waiting state."""
+    status = agent.get("agent_status")
+    if status in WAITING:
+        return None
+    return (f"STOP: attached agent {agent_label(agent)} is "
+            f"{status or 'in an unknown state'}. Wait until it is idle, done or blocked.")
+
+
 def cmd_restart(args):
     """Quit one project's Bram and relaunch it attached to the same herdr
     agent, or (--fresh) to a new agent in a new pane."""
@@ -878,10 +911,9 @@ def cmd_restart(args):
         raise SystemExit(f"no running Bram for {project}; use `up` instead")
     old_pid = int(rec["pid"])
     table = process_table()
-    cmd = table.get(old_pid, (0, ""))[1].split()
-    if not cmd or os.path.basename(cmd[0]) != "bram":
-        raise SystemExit(f"pid {old_pid} from .bram-port.json is not a bram process "
-                         f"({' '.join(cmd) or 'gone'}); not killing it")
+    why = not_this_brams_pid(old_pid, project, table)
+    if why:
+        raise SystemExit(why)
     claim = project / "resources" / ".inflight-claim.json"
     if claim.exists():
         stop(f"STOP: {claim} exists (a Worklist claim is in flight). "
@@ -890,13 +922,12 @@ def cmd_restart(args):
     if not pane:
         raise SystemExit(f"Bram pid {old_pid} has no herdr agent attached; "
                          "quit it by hand and use `up --pane <id>`")
-    match = [a for a in herdr_agents() if a["pane_id"] == pane]
-    if not match:
+    old_agent = find_agent(pane)
+    if not old_agent:
         raise SystemExit(f"attached pane {pane} is not a herdr agent")
-    old_agent = match[0]
-    if old_agent.get("agent_status") == "working":
-        stop(f"STOP: attached agent {agent_label(old_agent)} is working. "
-             "Wait until it is idle/done.")
+    busy = agent_not_quiet(old_agent)
+    if busy:
+        stop(busy)
     if args.expect_head:
         head = run(["git", "-C", str(project), "log", "-1", "--format=%H"],
                    check=False).strip()
@@ -916,7 +947,21 @@ def cmd_restart(args):
     # 2. Quit this project's Bram only, by pid (never pkill: other Brams run).
     print(f"step: {tag}kill {old_pid} (Bram for {project.name}) and wait up to 10 s")
     if not dry:
-        os.kill(old_pid, 15)
+        # Re-check right before signalling: the checks above may be seconds old.
+        current = find_agent(pane)
+        again = (not_this_brams_pid(old_pid, project, process_table())
+                 or (agent_not_quiet(current) if current
+                     else f"STOP: pane {pane} is no longer a herdr agent.")
+                 or (f"STOP: {claim} appeared (a Worklist claim is in flight)."
+                     if claim.exists() else None))
+        if again:
+            raise SystemExit(f"{again}\nNothing was quit.")
+        try:
+            os.kill(old_pid, 15)
+        except ProcessLookupError:
+            pass  # already gone: carry on with the relaunch
+        except PermissionError as e:
+            raise SystemExit(f"could not stop Bram pid {old_pid}: {e}. Nothing was quit.")
         deadline = time.time() + 10
         while pid_alive(old_pid) and time.time() < deadline:
             time.sleep(0.5)
@@ -925,34 +970,45 @@ def cmd_restart(args):
                              "nothing relaunched. Check its window.")
         print(f"  ok Bram {old_pid} exited")
 
-    # 3. Choose the agent.
-    if args.fresh:
-        print(f"step: {tag}herdr pane split {pane} --direction down "
-              f"--cwd {project} --no-focus")
-        print(f"step: {tag}herdr agent start {name} --kind claude --pane <new> "
-              + " ".join(model_args))
-        if dry:
-            new_pane = "<new-pane>"
+    # From here on Bram is quit (unless dry run). If any step fails, say so and
+    # give the exact command that brings it back.
+    recover_pane = pane
+    try:
+        # 3. Choose the agent.
+        if args.fresh:
+            print(f"step: {tag}herdr pane split {pane} --direction down "
+                  f"--cwd {project} --no-focus")
+            print(f"step: {tag}herdr agent start {name} --kind claude --pane <new> "
+                  + " ".join(model_args))
+            if dry:
+                new_pane = "<new-pane>"
+            else:
+                new_pane = split_pane(pane, project)
+                recover_pane = new_pane
+                print(f"  ok new pane {new_pane}")
+                time.sleep(1)  # let its shell reach a prompt
+                r = subprocess.run(["herdr", "agent", "start", name, "--kind", "claude",
+                                    "--pane", new_pane, *model_args],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise SystemExit(f"agent start failed in {new_pane}:\n"
+                                     f"{(r.stdout + r.stderr).strip()[:600]}")
+                print(f"  ok agent {name} started in {new_pane}")
+            agent = {"pane_id": new_pane, "agent": "claude", "agent_status": "new",
+                     "name": name}
         else:
-            new_pane = split_pane(pane, project)
-            print(f"  ok new pane {new_pane}")
-            time.sleep(1)  # let its shell reach a prompt
-            r = subprocess.run(["herdr", "agent", "start", name, "--kind", "claude",
-                                "--pane", new_pane, *model_args],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                raise SystemExit(f"agent start failed in {new_pane} (Bram is quit; "
-                                 f"rerun `up {project} --pane <id>`):\n"
-                                 f"{(r.stdout + r.stderr).strip()[:600]}")
-            print(f"  ok agent {name} started in {new_pane}")
-        agent = {"pane_id": new_pane, "agent": "claude", "agent_status": "new",
-                 "name": name}
-    else:
-        agent = old_agent
+            agent = old_agent
 
-    # 4. Relaunch through up().
-    print(f"step: {tag}relaunch Bram via up --pane {agent['pane_id']}")
-    new_pid, got = up(project, dry_run=dry, agent=agent, bram_quit_first=dry)
+        # 4. Relaunch through up().
+        print(f"step: {tag}relaunch Bram via up --pane {agent['pane_id']}")
+        new_pid, got = up(project, dry_run=dry, agent=agent, bram_quit_first=dry)
+    except (Exception, SystemExit) as e:
+        if dry:
+            raise
+        detail = str(e) if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"
+        raise SystemExit(f"{detail}\nBram for {project.name} is quit and was NOT "
+                         f"relaunched. To bring it back: bram_herdr.py up {project} "
+                         f"--pane {recover_pane}")
 
     # 5. Prompts, only once the attach is confirmed.
     target = agent["pane_id"]

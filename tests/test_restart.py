@@ -199,6 +199,17 @@ class RestartRefuses(RestartWorld):
             self.restart()
         self.assertEqual(self.killed, [(OLD_PID, 15)])
 
+    def test_an_option_is_never_taken_for_a_directory_name(self):
+        # Codex round 4: `bram --some-flag` must be refused even if a directory
+        # named "--some-flag" exists in the Bram's working directory.
+        base = self.proj
+        project = base / "--some-flag"
+        project.mkdir()
+        self.proj = project
+        self.bram_cmd = "/src/bram/app/bram --some-flag"
+        with mock.patch.object(bh, "process_cwd", return_value=str(base)):
+            self.assert_refuses("isn't exactly")
+
     def test_a_bram_started_with_options_is_refused_not_guessed(self):
         self.bram_cmd = f"/src/bram/app/bram --some-flag {self.proj}"
         self.assert_refuses("isn't exactly")

@@ -889,8 +889,8 @@ def bram_arg_is(pid, argv, project):
     with options, or with a relative path whose working directory can't be
     read, is refused rather than guessed at."""
     arg = " ".join(argv[1:])
-    if not arg:
-        return False
+    if not arg or argv[1].startswith("-"):
+        return False  # no argument, or an option (Bram's CLI reads `-x` as one too)
     if not os.path.isabs(arg):
         cwd = process_cwd(pid)
         if not cwd:

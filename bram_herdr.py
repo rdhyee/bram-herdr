@@ -812,9 +812,10 @@ def up(project, pane=None, kind=None, exclude=False, dry_run=False,
             print("\nNext: click into Bram's terminal and run (it's also on the clipboard):")
         print(f"\n    {attach}\n")
         return pid, None
-    except Exception as e:
+    except (Exception, SystemExit) as e:
+        detail = str(e) if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"
         raise LaunchedError(f"Bram was launched (pid {pid}), but a later step failed: "
-                            f"{type(e).__name__}: {e}\nCheck its window and run "
+                            f"{detail}\nCheck its window and run "
                             "`bram_herdr.py status`.") from e
 
 
@@ -875,27 +876,27 @@ def not_this_brams_pid(pid, project, table):
         return (f"pid {pid} from .bram-port.json is not a bram process "
                 f"({' '.join(argv) or 'gone'}); not killing it")
     if not bram_arg_is(pid, argv, project):
-        return (f"pid {pid} is a Bram, but not for {project} (stale "
-                ".bram-port.json?); not killing it")
+        return (f"pid {pid} is a Bram, but its command line isn't exactly `bram {project}` "
+                "(stale .bram-port.json, or launched with options?); not killing it")
     return None
 
 
 def bram_arg_is(pid, argv, project):
-    """True if the text after the executable in `argv` names `project`. `ps`
-    gives one flat string, so a project path with spaces can't be split into
-    arguments; instead try every tail of the command line as the whole path,
-    so "/a/b c" is never mistaken for "/a/b"."""
-    cwd = None
-    for k in range(1, len(argv)):
-        arg = " ".join(argv[k:])
-        if not os.path.isabs(arg):
-            cwd = cwd or process_cwd(pid)
-            if not cwd:
-                continue  # can't resolve a relative path: fail closed, never guess
-            arg = os.path.join(cwd, arg)
-        if os.path.isdir(arg) and same_dir(arg, project):
-            return True
-    return False
+    """True if everything after the executable in `argv` is exactly `project`.
+    `ps` gives one flat string, so a project path with spaces can't be split
+    into arguments, and any partial reading ("foo bar" as "bar") could name the
+    wrong project. So match the WHOLE remainder or fail closed: a Bram started
+    with options, or with a relative path whose working directory can't be
+    read, is refused rather than guessed at."""
+    arg = " ".join(argv[1:])
+    if not arg:
+        return False
+    if not os.path.isabs(arg):
+        cwd = process_cwd(pid)
+        if not cwd:
+            return False
+        arg = os.path.join(cwd, arg)
+    return os.path.isdir(arg) and same_dir(arg, project)
 
 
 def find_agent(pane):

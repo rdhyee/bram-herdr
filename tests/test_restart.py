@@ -166,7 +166,7 @@ class RestartRefuses(RestartWorld):
         # now belongs to a Bram for a different project.
         with tempfile.TemporaryDirectory() as other:
             self.bram_cmd = f"/src/bram/app/bram {other}"
-            self.assert_refuses("not for")
+            self.assert_refuses("isn't exactly")
 
     def test_a_project_path_that_is_a_prefix_of_another_is_not_confused(self):
         # Codex round 2, finding 1: a Bram for "<proj> extra" is not the Bram for "<proj>"
@@ -174,11 +174,38 @@ class RestartRefuses(RestartWorld):
         other.mkdir()
         self.addCleanup(other.rmdir)
         self.bram_cmd = f"/src/bram/app/bram {other}"
-        self.assert_refuses("not for")
+        self.assert_refuses("isn't exactly")
+
+    def test_a_path_with_spaces_is_not_matched_by_its_tail(self):
+        # Codex round 3, finding 1: `bram foo bar` (project "<base>/foo bar")
+        # must not be taken for the project "<base>/bar".
+        base = self.proj
+        project = base / "bar"
+        other = base / "foo bar"
+        project.mkdir()
+        other.mkdir()
+        self.proj = project
+        self.bram_cmd = "/src/bram/app/bram foo bar"
+        with mock.patch.object(bh, "process_cwd", return_value=str(base)):
+            self.assert_refuses("isn't exactly")
+
+    def test_relative_arg_resolved_against_the_brams_own_cwd_is_accepted(self):
+        base = self.proj
+        project = base / "proj"
+        project.mkdir()
+        self.proj = project
+        self.bram_cmd = "/src/bram/app/bram proj"
+        with mock.patch.object(bh, "process_cwd", return_value=str(base)):
+            self.restart()
+        self.assertEqual(self.killed, [(OLD_PID, 15)])
+
+    def test_a_bram_started_with_options_is_refused_not_guessed(self):
+        self.bram_cmd = f"/src/bram/app/bram --some-flag {self.proj}"
+        self.assert_refuses("isn't exactly")
 
     def test_relative_project_arg_with_unknown_cwd_fails_closed(self):
         self.bram_cmd = "/src/bram/app/bram ."
-        self.assert_refuses("not for")   # process_cwd is mocked to None in setUp
+        self.assert_refuses("isn't exactly")   # process_cwd is mocked to None in setUp
 
     def test_agent_turns_busy_between_check_and_kill(self):
         # finding 2: the first look says idle, the look just before the kill says working

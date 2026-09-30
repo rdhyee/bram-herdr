@@ -210,6 +210,17 @@ class RestartRefuses(RestartWorld):
         with mock.patch.object(bh, "process_cwd", return_value=str(base)):
             self.assert_refuses("isn't exactly")
 
+    def test_a_flag_after_the_project_is_never_part_of_the_path(self):
+        # Codex round 5: `bram real-project --minimized` must not match a directory
+        # literally named "real-project --minimized".
+        base = self.proj
+        project = base / "real-project --minimized"
+        project.mkdir()
+        self.proj = project
+        self.bram_cmd = "/src/bram/app/bram real-project --minimized"
+        with mock.patch.object(bh, "process_cwd", return_value=str(base)):
+            self.assert_refuses("isn't exactly")
+
     def test_a_bram_started_with_options_is_refused_not_guessed(self):
         self.bram_cmd = f"/src/bram/app/bram --some-flag {self.proj}"
         self.assert_refuses("isn't exactly")

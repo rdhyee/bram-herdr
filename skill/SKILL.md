@@ -42,7 +42,7 @@ description: Put a project under Bram with its agent owned by herdr, without the
 
 ## Switching the attached agent
 
-Bram records the agent's identity **at launch only**. To move Bram from Codex to Claude: change `shell.agent` in `.bram.json` → quit Bram → relaunch → attach the other pane, giving the `herdr agent attach <pane>` line in chat as in step 6. If the identity is stale, Bram ignores the attached agent's turn-ends for claims, so the spinner won't clear.
+Bram records the agent's identity **at launch only**. To move Bram from Codex to Claude: change `shell.agent` in `.bram.json` → quit Bram → relaunch → attach the other pane, giving the `herdr agent attach <pane>` line in chat as in step 6. If the identity is stale, Bram ignores the attached agent's turn-ends for claims, so the spinner won't clear. `bram_herdr.py restart --fresh` automates the quit, the new agent and the relaunch.
 
 ## Talking to agents
 
@@ -80,6 +80,7 @@ Tracked on judell/bram#389:
   - It auto-attaches the pane via `PROMPT_COMMAND` (step 6) and waits for the `op=autostart` trace line.
   - It checks that `CLAUDE.md`/`AGENTS.md` kept the user's text outside Bram's `<!-- bram:start/end -->` block. Setup may legitimately refresh the block itself.
   - **Always `--dry-run` first on a new project.**
+- `bram_herdr.py restart <project> [--fresh] [--model M] [--name N] [--resume] [--expect-head SHA] [--dry-run]`: quit that project's Bram (by pid only, never `pkill`) and relaunch it through `up`, on the same herdr pane or, with `--fresh`, a new agent in a new pane below it (the old agent is kept). It stops first if a Worklist claim is in flight, the attached agent isn't idle/done/blocked, the pid isn't this project's Bram, or `--expect-head` doesn't match, and if a step fails after the quit it prints the `up` command that brings the Bram back. **Always `--dry-run` first**, and run it only when the user asked for a restart, because a real run quits their Bram. After a restart, give the user the new `herdr agent attach` line if `up` reports the auto-attach wasn't seen.
 - `bram_herdr.py front <project>`: bring that project's Bram window to the front (macOS). `<project>` is a path or just the folder name. It raises the Bram process by pid via `osascript` / System Events, and macOS may ask for Automation permission the first time. Use it when the user says "show me the X Bram". It also marks that Bram's attached agent as seen.
 - `bram_herdr.py seen [<pane> ...] [--all]`: mark herdr agents as looked at, which clears their `●`.
 - `bram_herdr.py say [<project>] "<text>" [--pane <id>] [--wait]`: `herdr agent prompt` to the agent attached to that project's Bram.

@@ -664,11 +664,16 @@ def pick_agent(project, pane, kind):
     raise SystemExit(2)
 
 
-def launch_bram(project, dry, attach=None):
+def check_bram_repo():
+    """Fail early, before `up` writes anything, if BRAM_REPO has no ./bram."""
     if not (BRAM_REPO / "bram").exists():
         raise SystemExit(f"no ./bram symlink in {BRAM_REPO}. Set BRAM_REPO to your "
                          "judell/bram checkout (built from main at or after 1aa63a1).")
-    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+
+
+def launch_bram(project, dry, attach=None):
+    check_bram_repo()
+    env ={k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
     if attach:
         # Auto-attach with no Bram change. Bram's terminal is
         # bash (--noprofile --rcfile app/shell/claude-code-shellrc -i) and it
@@ -730,6 +735,7 @@ def cmd_up(args):
     if rec and pid_alive(rec.get("pid")):
         raise SystemExit(f"Bram is already running for {project} (pid {rec['pid']}). "
                          "Quit it first, or use `status`.")
+    check_bram_repo()  # before anything is written to the project
     agent = pick_agent(project, args.pane, args.kind)
     kind = agent["agent"]
     if kind not in ("claude", "codex"):

@@ -19,6 +19,10 @@ Commands:
      [--kind claude|codex]    Bram, and attach the herdr agent automatically
      [--exclude] [--dry-run]  (PROMPT_COMMAND in Bram's inherited env; see
      [--no-auto-attach]       launch_bram). Warns if the pane is already held.
+  restart PROJECT [--fresh    Safety checks (no in-flight claim, agent not
+     [--model M] [--name N]]  working, [--expect-head SHA]), quit that Bram by
+     [--resume] [--dry-run]   pid only, relaunch via `up` on the same pane or
+                              (--fresh) a new agent in a new pane below it.
   front PROJECT               Bring that project's Bram window to the front
                               (PROJECT: path or folder name, e.g. myproject).
   say PROJECT TEXT [--wait]   Prompt the herdr agent attached to PROJECT's
@@ -730,38 +734,44 @@ def wait_for_autostart(project, since_ms, timeout=45):
     return None
 
 
-def cmd_up(args):
-    project = Path(args.project).expanduser().resolve()
+def up(project, pane=None, kind=None, exclude=False, dry_run=False,
+       no_auto_attach=False, agent=None, bram_quit_first=False):
+    """Launch Bram for project and attach a herdr agent. Returns (pid, attached
+    pane or None); pid is None on a dry run. `agent` skips pick_agent (restart
+    passes a planned pane on a dry run); `bram_quit_first` skips the "already
+    running" refusal on a restart dry run, where the quit is only planned."""
+    project = Path(project).expanduser().resolve()
     if not project.is_dir():
         raise SystemExit(f"not a directory: {project}")
     rec = port_record(project)
-    if rec and pid_alive(rec.get("pid")):
+    if rec and pid_alive(rec.get("pid")) and not bram_quit_first:
         raise SystemExit(f"Bram is already running for {project} (pid {rec['pid']}). "
-                         "Quit it first, or use `status`.")
+                         "Quit it first, use `restart`, or use `status`.")
     check_bram_repo()  # before anything is written to the project
-    agent = pick_agent(project, args.pane, args.kind)
+    if agent is None:
+        agent = pick_agent(project, pane, kind)
     kind = agent["agent"]
     if kind not in ("claude", "codex"):
         raise SystemExit(f"pane {agent['pane_id']} runs {kind}; Bram supports claude/codex")
     print(f"project: {project}\nagent:   {agent_label(agent)}")
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    before = preflight(project, stamp, args.dry_run)
-    merge_bram_json(project, kind, args.dry_run)
-    if args.exclude:
-        add_excludes(project, args.dry_run)
+    before = preflight(project, stamp, dry_run)
+    merge_bram_json(project, kind, dry_run)
+    if exclude:
+        add_excludes(project, dry_run)
 
     # Plain `herdr` (PATH is inherited): attached_pane() matches on the
     # command line starting with "herdr agent attach".
     attach = f"herdr agent attach {agent['pane_id']}"
-    if not args.dry_run:
+    if not dry_run:
         warn_existing_attaches(agent["pane_id"])
-    auto = not args.no_auto_attach
+    auto = not no_auto_attach
     since = int(time.time() * 1000)
-    pid = launch_bram(project, args.dry_run, attach=attach if auto else None)
-    if args.dry_run:
+    pid = launch_bram(project, dry_run, attach=attach if auto else None)
+    if dry_run:
         print(f"  (dry run) would {'auto-attach' if auto else 'copy to clipboard'}: {attach}")
-        return
+        return None, None
     if shutil.which("pbcopy"):
         subprocess.run(["pbcopy"], input=attach, text=True)
     else:
@@ -785,11 +795,194 @@ def cmd_up(args):
                 time.sleep(1)
         if got:
             print(f"  ok attached: {got} (no typing needed)")
-            return
+            return pid, got
         print("  !! auto-attach not seen within 20 s. Fall back to typing it:")
     else:
         print("\nNext: click into Bram's terminal and run (it's also on the clipboard):")
     print(f"\n    {attach}\n")
+    return pid, None
+
+
+def cmd_up(args):
+    up(args.project, pane=args.pane, kind=args.kind, exclude=args.exclude,
+       dry_run=args.dry_run, no_auto_attach=args.no_auto_attach)
+
+
+# ---------- restart ----------
+
+def find_pane_id(obj):
+    """First "pane_id" value anywhere in herdr's JSON reply."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get("pane_id"), str):
+            return obj["pane_id"]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for v in obj:
+            got = find_pane_id(v)
+            if got:
+                return got
+    return None
+
+
+def split_pane(from_pane, project):
+    """New pane below from_pane, in project. `--direction` is REQUIRED: without
+    it `herdr pane split` prints usage and creates nothing (exit status aside,
+    a grep of its output hides that), so check the reply for a pane id."""
+    cmd = ["herdr", "pane", "split", from_pane, "--direction", "down",
+           "--cwd", str(project), "--no-focus"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        new = find_pane_id(json.loads(r.stdout).get("result"))
+    except ValueError:
+        new = None
+    if r.returncode != 0 or not new or new == from_pane:
+        raise SystemExit(f"pane split failed ({' '.join(cmd)}):\n"
+                         f"{(r.stdout + r.stderr).strip()[:600]}")
+    return new
+
+
+def herdr_prompt(target, text):
+    r = subprocess.run(["herdr", "agent", "prompt", target, text],
+                       capture_output=True, text=True)
+    ok = r.returncode == 0
+    print(f"  {'ok' if ok else '!!'} prompt {target}: {text}"
+          f"{'' if ok else '  -> ' + (r.stdout + r.stderr).strip()[:300]}")
+    return ok
+
+
+def cmd_restart(args):
+    """Quit one project's Bram and relaunch it attached to the same herdr
+    agent, or (--fresh) to a new agent in a new pane."""
+    need("herdr", "install herdr, see https://herdr.dev")
+    if not args.fresh and (args.model or args.name):
+        raise SystemExit("--model and --name only apply with --fresh")
+    dry = args.dry_run
+    tag = "(dry run) would " if dry else ""
+    project = Path(args.project).expanduser().resolve()
+    if not project.is_dir():
+        raise SystemExit(f"not a directory: {project}")
+    blocked = []
+
+    def stop(msg):
+        """A failed safety check: stops a real run; a dry run notes it and
+        carries on so every step still prints."""
+        if not dry:
+            raise SystemExit(msg)
+        blocked.append(msg)
+        print(f"!! {msg}  (a real run would stop here)")
+
+    # 1. Safety checks, before anything is touched.
+    check_bram_repo()
+    rec = port_record(project)
+    if not (rec and pid_alive(rec.get("pid"))):
+        raise SystemExit(f"no running Bram for {project}; use `up` instead")
+    old_pid = int(rec["pid"])
+    table = process_table()
+    cmd = table.get(old_pid, (0, ""))[1].split()
+    if not cmd or os.path.basename(cmd[0]) != "bram":
+        raise SystemExit(f"pid {old_pid} from .bram-port.json is not a bram process "
+                         f"({' '.join(cmd) or 'gone'}); not killing it")
+    claim = project / "resources" / ".inflight-claim.json"
+    if claim.exists():
+        stop(f"STOP: {claim} exists (a Worklist claim is in flight). "
+             "Let it finish or clear it first.")
+    pane = attached_pane(old_pid, table)
+    if not pane:
+        raise SystemExit(f"Bram pid {old_pid} has no herdr agent attached; "
+                         "quit it by hand and use `up --pane <id>`")
+    match = [a for a in herdr_agents() if a["pane_id"] == pane]
+    if not match:
+        raise SystemExit(f"attached pane {pane} is not a herdr agent")
+    old_agent = match[0]
+    if old_agent.get("agent_status") == "working":
+        stop(f"STOP: attached agent {agent_label(old_agent)} is working. "
+             "Wait until it is idle/done.")
+    if args.expect_head:
+        head = run(["git", "-C", str(project), "log", "-1", "--format=%H"],
+                   check=False).strip()
+        if not head or not head.startswith(args.expect_head):
+            stop(f"STOP: HEAD is {head or '?'}, expected {args.expect_head}")
+        else:
+            print(f"ok HEAD {head[:12]} matches --expect-head")
+    print(f"attached: {agent_label(old_agent)}")
+    if args.fresh:
+        name = args.name or f"{project.name}-{dt.date.today():%m%d}"
+        model_args = ["--", "--model", args.model] if args.model else []
+        print(f"plan: fresh agent {name!r}" + (f" ({args.model})" if args.model else "")
+              + f" in a new pane below {pane}; {pane} is kept")
+    else:
+        print(f"plan: reuse {pane}")
+
+    # 2. Quit this project's Bram only, by pid (never pkill: other Brams run).
+    print(f"step: {tag}kill {old_pid} (Bram for {project.name}) and wait up to 10 s")
+    if not dry:
+        os.kill(old_pid, 15)
+        deadline = time.time() + 10
+        while pid_alive(old_pid) and time.time() < deadline:
+            time.sleep(0.5)
+        if pid_alive(old_pid):
+            raise SystemExit(f"Bram pid {old_pid} did not exit within 10 s; "
+                             "nothing relaunched. Check its window.")
+        print(f"  ok Bram {old_pid} exited")
+
+    # 3. Choose the agent.
+    if args.fresh:
+        print(f"step: {tag}herdr pane split {pane} --direction down "
+              f"--cwd {project} --no-focus")
+        print(f"step: {tag}herdr agent start {name} --kind claude --pane <new> "
+              + " ".join(model_args))
+        if dry:
+            new_pane = "<new-pane>"
+        else:
+            new_pane = split_pane(pane, project)
+            print(f"  ok new pane {new_pane}")
+            time.sleep(1)  # let its shell reach a prompt
+            r = subprocess.run(["herdr", "agent", "start", name, "--kind", "claude",
+                                "--pane", new_pane, *model_args],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise SystemExit(f"agent start failed in {new_pane} (Bram is quit; "
+                                 f"rerun `up {project} --pane <id>`):\n"
+                                 f"{(r.stdout + r.stderr).strip()[:600]}")
+            print(f"  ok agent {name} started in {new_pane}")
+        agent = {"pane_id": new_pane, "agent": "claude", "agent_status": "new",
+                 "name": name}
+    else:
+        agent = old_agent
+
+    # 4. Relaunch through up().
+    print(f"step: {tag}relaunch Bram via up --pane {agent['pane_id']}")
+    new_pid, got = up(project, dry_run=dry, agent=agent, bram_quit_first=dry)
+
+    # 5. Prompts, only once the attach is confirmed.
+    target = agent["pane_id"]
+    if args.fresh:
+        print(f"step: {tag}herdr agent prompt {target} \"/rename {name}\"")
+    if args.resume:
+        print(f"step: {tag}herdr agent prompt {target} \"/resume\"")
+    if dry:
+        print("dry run: nothing changed" + (f"; {len(blocked)} safety check(s) "
+              "failed, so a real run would stop before quitting Bram" if blocked else ""))
+        return
+    if not got:
+        raise SystemExit("attach not confirmed; skipped prompts. See above.")
+    if args.fresh:
+        herdr_prompt(target, f"/rename {name}")
+    if args.resume:
+        herdr_prompt(target, "/resume")
+
+    # 6. Report.
+    rec, deadline = port_record(project), time.time() + 20
+    while not (rec and rec.get("pid") == new_pid) and time.time() < deadline:
+        time.sleep(1)
+        rec = port_record(project)
+    version = app_info(rec["port"]).get("current", "?") if rec else "?"
+    alive = any(a["pane_id"] == pane for a in herdr_agents())
+    print(f"\nrestarted {project.name}: Bram {version}  pid {new_pid}  "
+          f"port {rec.get('port') if rec else '?'}  attached: {got}")
+    if args.fresh:
+        print(f"old agent {pane} ({old_agent.get('name') or '?'}): "
+              f"{'still running (not retired)' if alive else 'NOT found in herdr'}")
 
 
 # ---------- front ----------
@@ -899,6 +1092,23 @@ def main():
     u.add_argument("--no-auto-attach", action="store_true",
                    help="don't attach automatically; just put the command on the clipboard")
     u.set_defaults(fn=cmd_up)
+    r = sub.add_parser("restart", help="quit a project's Bram and relaunch it, attached "
+                                       "to the same agent or a fresh one")
+    r.add_argument("project", help="project directory whose Bram to restart")
+    r.add_argument("--fresh", action="store_true",
+                   help="start a new agent in a new pane below the old one instead of "
+                        "reusing it (the old agent is kept)")
+    r.add_argument("--model", help="model for the fresh agent, passed to `herdr agent "
+                                   "start` (default: the agent's own); needs --fresh")
+    r.add_argument("--name", help="name for the fresh agent (default: PROJECT-MMDD); "
+                                  "needs --fresh")
+    r.add_argument("--resume", action="store_true",
+                   help="send /resume to the agent once the attach is confirmed")
+    r.add_argument("--expect-head", metavar="SHA",
+                   help="stop unless the project's git HEAD starts with SHA")
+    r.add_argument("--dry-run", action="store_true",
+                   help="print every step and failed safety check; change nothing")
+    r.set_defaults(fn=cmd_restart)
     f = sub.add_parser("front", help="bring a project's Bram window to the front (macOS)")
     f.add_argument("project", help="path, or just the folder name (e.g. myproject)")
     f.set_defaults(fn=cmd_front)

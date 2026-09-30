@@ -2,6 +2,7 @@
 
 Run from the repo root:  python3 -m unittest discover -s tests
 """
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bram_herdr as bh  # noqa: E402
 
 
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
 class AddExcludes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

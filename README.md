@@ -26,6 +26,11 @@ bram_herdr.py up PROJECT [--pane ID] [--kind claude|codex] [--exclude] [--dry-ru
 Backs up `CLAUDE.md`/`AGENTS.md` if git can't restore them, sets "Do not start an agent" in `PROJECT/.bram.json`, launches Bram, and attaches the herdr agent working in `PROJECT`. Afterwards it checks Bram's trace log and that your instruction files kept their text. Use `--pane` when several agents work in the folder, and `--exclude` to add Bram's files to `.git/info/exclude`. **Run `--dry-run` first on a new project.**
 
 ```sh
+bram_herdr.py restart PROJECT [--fresh] [--model M] [--name N] [--resume] [--expect-head SHA] [--dry-run]
+```
+Quits that project's Bram and relaunches it, attached to the same herdr agent (or, with `--fresh`, to a new agent in a new pane below it; the old agent is kept). It refuses to start unless the checks pass: a Bram is running with a herdr agent attached, no Worklist claim is in flight, the attached agent isn't `working`, and (if you pass `--expect-head`) git's HEAD matches. It quits **only that Bram, by pid**, never by name. `--model` is handed to `herdr agent start` only when you give it; otherwise the agent uses its own default. `--resume` sends `/resume` once the new attach is confirmed. **Run `--dry-run` first**: it prints every step and every check that would have stopped a real run, and changes nothing.
+
+```sh
 bram_herdr.py front PROJECT
 ```
 Brings that project's Bram window to the front (macOS). `PROJECT` is a path or just the folder name. It also counts as looking at that Bram's attached agent, so the agent's `●` clears.

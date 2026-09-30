@@ -58,10 +58,13 @@ ASSIGNED_SHOWN = 5                      # assigned-to-you rows shown before "…
 WAITING = ("idle", "done", "blocked")   # herdr states where an agent is waiting on you
 INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
 # Bram-written paths that don't belong in a project's history (skill step 2).
+# .claude/settings.json is deliberately absent: Setup edits it, but a project
+# may have its own committed one, and excluding it would only get in the way.
 BRAM_EXCLUDES = (
     ".bram.json",
     "resources/",
     ".claude/bram-conventions.md",
+    ".claude/bram-reference/",
     ".claude/skills/loose-ends/",
     ".bram-preflight/",
 )

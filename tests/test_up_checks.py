@@ -85,5 +85,25 @@ class UpWritesNothingWhenRepoIsWrong(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in Path(proj).iterdir()), ["CLAUDE.md"])
 
 
+class UpAfterLaunch(unittest.TestCase):
+    def test_failure_after_the_launch_says_bram_is_running(self):
+        # Codex round 2, finding 3: up() raises LaunchedError once Bram has started
+        with tempfile.TemporaryDirectory() as proj:
+            agent = {"pane_id": "w1:p2", "agent": "claude", "agent_status": "idle"}
+            with mock.patch.object(bh, "check_bram_repo"), \
+                 mock.patch.object(bh, "port_record", return_value=None), \
+                 mock.patch.object(bh, "preflight", return_value={}), \
+                 mock.patch.object(bh, "merge_bram_json"), \
+                 mock.patch.object(bh, "warn_existing_attaches"), \
+                 mock.patch.object(bh, "launch_bram", return_value=31337), \
+                 mock.patch.object(bh.shutil, "which", return_value=None), \
+                 mock.patch.object(bh, "wait_for_autostart", side_effect=OSError("disk")), \
+                 mock.patch("builtins.print"):
+                with self.assertRaises(bh.LaunchedError) as cm:
+                    bh.up(proj, agent=agent)
+        self.assertIn("pid 31337", str(cm.exception))
+        self.assertIn("OSError: disk", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

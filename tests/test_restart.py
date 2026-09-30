@@ -168,6 +168,18 @@ class RestartRefuses(RestartWorld):
             self.bram_cmd = f"/src/bram/app/bram {other}"
             self.assert_refuses("not for")
 
+    def test_a_project_path_that_is_a_prefix_of_another_is_not_confused(self):
+        # Codex round 2, finding 1: a Bram for "<proj> extra" is not the Bram for "<proj>"
+        other = Path(f"{self.proj} extra")
+        other.mkdir()
+        self.addCleanup(other.rmdir)
+        self.bram_cmd = f"/src/bram/app/bram {other}"
+        self.assert_refuses("not for")
+
+    def test_relative_project_arg_with_unknown_cwd_fails_closed(self):
+        self.bram_cmd = "/src/bram/app/bram ."
+        self.assert_refuses("not for")   # process_cwd is mocked to None in setUp
+
     def test_agent_turns_busy_between_check_and_kill(self):
         # finding 2: the first look says idle, the look just before the kill says working
         looks = iter([[agent()], [agent(status="working")]])
@@ -249,6 +261,32 @@ class RestartRuns(RestartWorld):
                 self.assertIn("quit and was NOT relaunched", msg)
                 self.assertIn(f"up {self.proj} --pane w1:p2", msg)
 
+    def test_failure_after_the_new_agent_started_recovers_on_the_new_pane(self):
+        replies = [completed(json.dumps({"result": {"pane_id": "w1:p9"}})), completed()]
+        self.up.side_effect = SystemExit("up failed")
+        with mock.patch.object(bh.subprocess, "run", side_effect=replies):
+            with self.assertRaises(SystemExit) as cm:
+                self.restart(fresh=True, name="demo")
+        self.assertIn(f"up {self.proj} --pane w1:p9", str(cm.exception))
+
+    def test_recovery_command_quotes_a_path_with_spaces(self):
+        spaced = self.proj / "my project"
+        spaced.mkdir()
+        self.proj = spaced
+        self.bram_cmd = f"/src/bram/app/bram {spaced}"
+        self.up.side_effect = SystemExit("up failed")
+        with self.assertRaises(SystemExit) as cm:
+            self.restart()
+        self.assertIn(f"up '{spaced}' --pane w1:p2", str(cm.exception))
+
+    def test_a_bram_that_launched_but_failed_a_later_step_is_reported_as_running(self):
+        # Codex round 2, finding 3: don't say "NOT relaunched" when it was launched
+        self.up.side_effect = bh.LaunchedError("Bram was launched (pid 9999), but x failed")
+        with self.assertRaises(SystemExit) as cm:
+            self.restart()
+        self.assertIn("Bram was launched", str(cm.exception))
+        self.assertNotIn("NOT relaunched", str(cm.exception))
+
     def test_pane_split_failure_after_the_kill_gives_the_recovery_command(self):
         with mock.patch.object(bh, "split_pane", side_effect=SystemExit("pane split failed")):
             with self.assertRaises(SystemExit) as cm:
@@ -315,7 +353,9 @@ class RestartRuns(RestartWorld):
             with self.assertRaises(SystemExit) as cm:
                 self.restart(fresh=True, name="demo")
         self.assertIn("NOT relaunched", str(cm.exception))
-        self.assertIn(f"up {self.proj} --pane w1:p9", str(cm.exception))
+        # Codex round 2, finding 2: the new pane has no agent, so recover on the old one
+        self.assertIn(f"up {self.proj} --pane w1:p2", str(cm.exception))
+        self.assertNotIn("--pane w1:p9", str(cm.exception))
         self.up.assert_not_called()
 
 
